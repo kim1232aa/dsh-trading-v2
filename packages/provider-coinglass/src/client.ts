@@ -43,6 +43,8 @@ interface RawPull {
 
 /** Oldest raw pull still served when CoinGlass refuses a fresh one. */
 const STALE_MAX_MS = 10 * 60_000
+/** Bound retained decrypted payloads across symbols, venues and hours windows. */
+const RAW_PULL_CACHE_LIMIT = 256
 /** First cooldown after HTTP 429; doubles per repeated 429 up to the max. */
 const COOLDOWN_BASE_MS = 15_000
 const COOLDOWN_MAX_MS = 120_000
@@ -331,6 +333,17 @@ export class CoinglassCapi {
     this.now = config.now ?? Date.now
   }
 
+  /** Lazy expiration plus LRU capacity; in-flight requests remain independently shared. */
+  private pruneRawPulls(): void {
+    const now = this.now()
+    for (const [key, pull] of this.rawPulls) {
+      if (now - pull.at > STALE_MAX_MS) this.rawPulls.delete(key)
+    }
+    while (this.rawPulls.size > RAW_PULL_CACHE_LIMIT) {
+      this.rawPulls.delete(this.rawPulls.keys().next().value!)
+    }
+  }
+
   /** Start (or double) the HTTP 429 cooldown. A fan-out collects several 429s at once; escalate once per round. */
   private noteRateLimit(): void {
     const now = this.now()
@@ -355,8 +368,13 @@ export class CoinglassCapi {
   ): Promise<RawPull> {
     const key = kind === 'walls' ? `${cgSymbol}|${hours}` : `trades|${cgSymbol}|${hours}`
     const t = this.now()
+    this.pruneRawPulls()
     const cached = this.rawPulls.get(key)
-    if (cached && t - cached.at < ttlMs) return Promise.resolve(cached)
+    if (cached) {
+      this.rawPulls.delete(key)
+      this.rawPulls.set(key, cached)
+      if (t - cached.at < ttlMs) return Promise.resolve(cached)
+    }
     const usable = (): RawPull | undefined => {
       const last = this.rawPulls.get(key)
       return last && this.now() - last.at <= STALE_MAX_MS ? last : undefined
@@ -376,7 +394,9 @@ export class CoinglassCapi {
         (groups): RawPull => {
           this.rawInflight.delete(key)
           const pull = { at: this.now(), groups }
+          this.rawPulls.delete(key)
           this.rawPulls.set(key, pull)
+          this.pruneRawPulls()
           this.cooldownMs = 0
           return pull
         },

@@ -32,10 +32,34 @@ class Scripted extends CoinglassCapi {
   }
 }
 
+const RAW_PULL_CACHE_LIMIT = 256
 const ALL = buildMultiExchangeCgSymbols('BTCUSDT')
 const too = () => Promise.reject(new Error('coinglass HTTP 429: {"code":429,"message":"Too Many Requests"}'))
 
 describe('CoinGlass pull cache / dedupe / 429 cooldown', () => {
+  it('bounds raw cache retention and evicts the least recently used window', async () => {
+    const c = new Scripted()
+    const opts = { venue: 'Binance', statistics: false }
+    for (let hours = 1; hours <= RAW_PULL_CACHE_LIMIT; hours++) await c.getLargeOrders('BTCUSDT', { ...opts, hours })
+    await c.getLargeOrders('BTCUSDT', { ...opts, hours: 1 }) // keep the oldest entry hot
+    await c.getLargeOrders('BTCUSDT', { ...opts, hours: RAW_PULL_CACHE_LIMIT + 1 })
+    const before = c.calls.length
+    await c.getLargeOrders('BTCUSDT', { ...opts, hours: 1 })
+    expect(c.calls.length).toBe(before)
+    await c.getLargeOrders('BTCUSDT', { ...opts, hours: 2 })
+    expect(c.calls.length).toBe(before + 1)
+    expect((Reflect.get(c, 'rawPulls') as Map<string, unknown>).size).toBeLessThanOrEqual(RAW_PULL_CACHE_LIMIT)
+  })
+
+  it('releases expired payloads even when a different symbol is requested', async () => {
+    const c = new Scripted()
+    await c.getLargeOrders('BTCUSDT', { venue: 'Binance', statistics: false })
+    c.clock += 11 * 60_000
+    await c.getLargeOrders('ETHUSDT', { venue: 'Binance', statistics: false })
+    const retained = Reflect.get(c, 'rawPulls') as Map<string, unknown>
+    expect([...retained.keys()].some(key => key.includes('BTCUSDT'))).toBe(false)
+  })
+
   it('recognises the capi 429 error text', () => {
     expect(isRateLimitError(new Error('coinglass HTTP 429: {"code":429}'))).toBe(true)
     expect(isRateLimitError(new Error('coinglass HTTP 500: x'))).toBe(false)

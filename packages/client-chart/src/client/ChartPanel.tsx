@@ -26,6 +26,9 @@ import type { ChartHistory } from './ChartCard.js'
 import { derivativesForTime, windowPosture } from './market-client.js'
 import { getLatestChart, subscribeLatestChart } from './latest.js'
 import { decideFollow } from './follow.js'
+import { startPanelPolling } from './panel-polling.js'
+import { dataForSeries, mergePanelTail, panelSeriesKey } from './panel-series.js'
+import type { PanelSeriesData } from './panel-series.js'
 import { combineMarks, displayedRows, dropCrossedWalls, filterWallsByMarket, wallDisplay, formatWallAge, isSpotWallMarket, mergeMarks, mergeTail, PANEL_TIMEFRAMES, postureColor, readMarks, recallMarks, rememberMarks, timeframesForSource, wallAgeSeconds, withCandles } from './market-client.js'
 import type { ChartMarks, MarketClient, PanelDerivatives, PanelLargeOrders, PanelMoneyFlow, WallMarketFilter } from './market-client.js'
 import type { ChartPayload } from './payload.js'
@@ -1012,7 +1015,7 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
   const [activeGroup, setActiveGroup] = useState<string>('全部')
   const [panelDerivatives, setPanelDerivatives] = useState<PanelDerivatives | null>(null)
   const [panelLargeWalls, setPanelLargeWalls] = useState<PanelLargeOrders | null>(null)
-  const [panelCvd, setPanelCvd] = useState<PanelCvdBar[] | null>(null)
+  const [panelCvd, setPanelCvd] = useState<PanelSeriesData<PanelCvdBar[]> | null>(null)
   const [cvdOn, setCvdOn] = useState(() => peekSettings()['CVD_FLOW']?.visible ?? false)
   const [largeWallsError, setLargeWallsError] = useState<string | null>(null)
   const wallPriceRef = useRef<number | undefined>(undefined)
@@ -1106,6 +1109,8 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
   const ownSymbol = own?.symbol
   const ownTf = own?.timeframes[0]?.timeframe
   const ownProvider = own?.provider
+  const latestOwn = useRef(own)
+  latestOwn.current = own
   const history = useMemo<ChartHistory | undefined>(() => {
     if (ownSymbol === undefined || ownTf === undefined || market.getBefore === undefined) return undefined
     const pId = manualProvider === 'auto' ? ownProvider : manualProvider
@@ -1130,36 +1135,32 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
   const wallSymbol = payload?.symbol
   const cvdTf = payload?.timeframes?.[0]?.timeframe
   const cvdProvider = payload?.provider
+  const cvdSeriesKey = panelSeriesKey(wallSymbol, cvdTf, cvdProvider)
+  // A resize while still open must not restart the polling effects.
+  const panelVisible = width > 0
 
   // 合约/现货 CVD: full series once per symbol/timeframe, then only the newest bars.
   useEffect(() => {
-    if (!cvdOn || !wallSymbol || !cvdTf || !market.getCvd) { setPanelCvd(null); return }
+    if (!cvdOn || !wallSymbol || !cvdTf || !market.getCvd || cvdSeriesKey === null) { setPanelCvd(null); return }
+    if (!panelVisible || !live) return
     const symbol = wallSymbol
     const tf = cvdTf
     setPanelCvd(null)
-    const ctl = new AbortController()
     let loaded = false
-    let busy = false
-    const pull = (): void => {
-      if (busy || (loaded && typeof document !== 'undefined' && document.hidden)) return
-      busy = true
-      market.getCvd!(symbol, tf, loaded ? 3 : 1000, cvdProvider, ctl.signal).then(
-        bars => {
-          busy = false
-          if (ctl.signal.aborted || bars === null) return
-          const full = !loaded
-          loaded = true
-          setPanelCvd(cur => (full || cur === null ? bars : mergeCvdBars(cur, bars)))
-        },
-        () => { busy = false },
-      )
-    }
-    pull()
-    const timer = setInterval(pull, CVD_MS)
-    return () => { ctl.abort(); clearInterval(timer) }
-  }, [cvdOn, market, wallSymbol, cvdTf, cvdProvider])
+    const poll = startPanelPolling({
+      enabled: cvdOn, live, width: panelVisible ? 1 : 0, intervalMs: CVD_MS,
+      load: signal => market.getCvd!(symbol, tf, loaded ? 3 : 1000, cvdProvider, signal),
+      onData: bars => {
+        if (bars === null) return
+        const full = !loaded
+        loaded = true
+        setPanelCvd(cur => ({ key: cvdSeriesKey, data: full || cur?.key !== cvdSeriesKey ? bars : mergeCvdBars(cur.data, bars) }))
+      },
+    })
+    return poll.dispose
+  }, [cvdOn, market, wallSymbol, cvdTf, cvdProvider, cvdSeriesKey, panelVisible, live])
 
-  // Poll CoinGlass large walls only while the overlay is enabled.
+  // No CVD/wall RPC, deadline or late state update survives pause/collapse.
   useEffect(() => {
     if (!largeWallsOn || !wallSymbol || !market.getLargeOrders) {
       setPanelLargeWalls(null)
@@ -1171,30 +1172,18 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
     // Another symbol's walls must never be drawn on this chart.
     setPanelLargeWalls(cur => (cur && cur.symbol === symbol ? cur : null))
     setLargeWallsError(null)
-    let active = true
-    let inFlight: AbortController | null = null
-    let seq = 0
-    const pull = (manual = false): void => {
-      if (!manual && inFlight !== null) return
-      if (!manual && typeof document !== 'undefined' && document.hidden) return
-      // A manual click preempts any slow background request; each request also
-      // gets a 25 s deadline so a stalled RPC cannot wedge the 20 s timer.
-      inFlight?.abort()
-      const ctl = new AbortController()
-      inFlight = ctl
-      const mySeq = ++seq
-      const deadline = setTimeout(() => ctl.abort(), 25_000)
-      const currentPrice = wallPriceRef.current
-      const disp = wallDisplay(peekSettings()['LARGE_WALLS']?.params)
-      // A switched-off book gets an unreachable cut; no trade book on = skip that request.
-      const OFF = Number.MAX_SAFE_INTEGER
-      const cut = (on: boolean, v: number): number => (on ? v : OFF)
-      const anyTrades = disp.showTrades.perp || disp.showTrades.spot
-      const maxDist = (peekSettings()['LARGE_WALLS']?.params?.[1] ?? 20) / 100
-      const sideLimit = peekSettings()['LARGE_WALLS']?.params?.[2] ?? 12
-      market.getLargeOrders!(
-        symbol,
-        {
+    const poll = startPanelPolling({
+      enabled: largeWallsOn, live, width: panelVisible ? 1 : 0, intervalMs: LARGE_WALLS_MS,
+      load: signal => {
+        const currentPrice = wallPriceRef.current
+        const disp = wallDisplay(peekSettings()['LARGE_WALLS']?.params)
+        // A switched-off book gets an unreachable cut; no trade book on = skip that request.
+        const OFF = Number.MAX_SAFE_INTEGER
+        const cut = (on: boolean, v: number): number => (on ? v : OFF)
+        const anyTrades = disp.showTrades.perp || disp.showTrades.spot
+        const maxDist = (peekSettings()['LARGE_WALLS']?.params?.[1] ?? 20) / 100
+        const sideLimit = peekSettings()['LARGE_WALLS']?.params?.[2] ?? 12
+        return market.getLargeOrders!(symbol, {
           hours: 168,
           top: Math.max(80, sideLimit * 4),
           marketType: wallMarket,
@@ -1205,41 +1194,18 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
           tradesMinUsd: anyTrades ? Math.max(1, cut(disp.showTrades.perp, disp.tradeMin.perp)) : 0,
           spotTradesMinUsd: cut(disp.showTrades.spot, disp.tradeMin.spot),
           ...(typeof currentPrice === 'number' ? { currentPrice } : {}),
-        },
-        ctl.signal,
-      ).then(
-        snap => {
-          clearTimeout(deadline)
-          if (inFlight === ctl) inFlight = null
-          if (!active || mySeq !== seq) return
-          setPanelLargeWalls(snap)
-          setLargeWallsError(null)
-        },
-        (err: unknown) => {
-          clearTimeout(deadline)
-          if (inFlight === ctl) inFlight = null
-          if (!active || mySeq !== seq) return
-          // Keep the last good walls on screen (marked stale) instead of
-          // blanking strip + overlay on one refused or timed-out poll.
-          setLargeWallsError(ctl.signal.aborted ? 'timeout' : (err instanceof Error ? err.message : String(err)))
-          setPanelLargeWalls(cur => (cur && cur.symbol === symbol ? { ...cur, stale: true } : cur))
-        },
-      )
-    }
-    pullLargeWallsRef.current = () => pull(true)
-    pull(true)
-    const timer = setInterval(() => pull(), LARGE_WALLS_MS)
-    // Hidden tabs skip polls; catch up as soon as the tab is shown again.
-    const onVisible = (): void => { if (!document.hidden) pull() }
-    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
-    return () => {
-      active = false
-      inFlight?.abort()
-      clearInterval(timer)
-      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
-      pullLargeWallsRef.current = null
-    }
-  }, [largeWallsOn, wallMarket, wallParamsKey, market, wallSymbol])
+        }, signal)
+      },
+      onData: snap => { setPanelLargeWalls(snap); setLargeWallsError(null) },
+      onError: (err: unknown) => {
+        // Keep the last good walls, explicitly stale, on a failed/timed-out poll.
+        setLargeWallsError(err instanceof Error ? err.message : String(err))
+        setPanelLargeWalls(cur => (cur && cur.symbol === symbol ? { ...cur, stale: true } : cur))
+      },
+    })
+    pullLargeWallsRef.current = poll.refresh
+    return () => { poll.dispose(); pullLargeWallsRef.current = null }
+  }, [largeWallsOn, wallMarket, wallParamsKey, market, wallSymbol, panelVisible, live])
 
 
   const load = useCallback(async (
@@ -1411,10 +1377,10 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
   // liveness feature that silently dies on a host's misreport is worse than
   // one that occasionally polls a tab nobody is reading.
   useEffect(() => {
-    if (!live || own === null || width === 0) return
-    const symbol = own.symbol
-    const tf = own.timeframes[0]?.timeframe
-    if (tf === undefined) return
+    if (!live || !panelVisible || ownSymbol === undefined || ownTf === undefined) return
+    const symbol = ownSymbol
+    const tf = ownTf
+    const key = panelSeriesKey(symbol, tf, ownProvider)!
 
     let stopped = false
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -1423,7 +1389,7 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
     const pump = async (): Promise<void> => {
       if (stopped) return
       try {
-        const pId = manualProvider === 'auto' ? own.provider : manualProvider
+        const pId = manualProvider === 'auto' ? ownProvider : manualProvider
         const tail = await market.getTail(symbol, tf, TAIL_BARS, pId, controller.signal)
         if (stopped) return
         // A refresh that succeeded is the end of a stall, whether or not the
@@ -1433,19 +1399,18 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
         // during render, twice under StrictMode.
         fails.current = 0
         setStalled(false)
-        setOwn(current => {
-          if (current === null) return current
-          const series = current.timeframes[0]?.candles ?? []
-          const nextSeries = mergeTail(series, tail)
-          if (nextSeries === series) {
-            quiet.current += 1
-            return current
-          }
+        const current = latestOwn.current
+        const next = mergePanelTail(current, key, tail)
+        if (next === current) quiet.current += 1
+        else {
           quiet.current = 0
           setTick(new Date().toLocaleTimeString())
-          return withCandles(current, nextSeries)
-        })
+          // Read the latest history again: paging can commit while this response is queued.
+          // The updater is pure even when React invokes it twice in StrictMode.
+          setOwn(value => mergePanelTail(value, key, tail))
+        }
       } catch {
+        if (stopped) return
         // A transient hiccup must not kill the loop or replace a good chart
         // with an error — but a SUSTAINED one must not keep claiming "Live"
         // over a frozen chart either. That combination is what makes a dead
@@ -1469,7 +1434,7 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
       controller.abort()
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [live, own, width, market, manualProvider])
+  }, [live, ownSymbol, ownTf, ownProvider, panelVisible, market, manualProvider])
 
   if (width === 0) return null
 
@@ -1869,7 +1834,7 @@ function ChartPanelInner({ width, market }: ChartOwnerProps & ChartPanelInject):
             : payload !== null
               ? (
                 <ChartErrorBoundary>
-                  <ChartBody payload={payload} history={payload === own || payload === merged?.payload ? history : undefined} shell={PANEL_SHELL} fill prose={false} derivatives={panelDerivatives} cvd={panelCvd} largeWalls={panelLargeWalls} wallMarket={wallMarket} onCrosshairHover={setHoveredTime} />
+                  <ChartBody payload={payload} history={payload === own || payload === merged?.payload ? history : undefined} shell={PANEL_SHELL} fill prose={false} derivatives={panelDerivatives} cvd={cvdOn ? dataForSeries(panelCvd, cvdSeriesKey) : null} largeWalls={panelLargeWalls} wallMarket={wallMarket} onCrosshairHover={setHoveredTime} />
                 </ChartErrorBoundary>
               )
               : (

@@ -19,6 +19,7 @@ import type { Chart, KLineData } from 'klinecharts'
 import {
   createCandleDataLoader,
   createIndicatorInPane,
+  syncIndicatorInPane,
   ensureChartThemes,
   hasIndicator,
   overrideIndicator as overrideInd,
@@ -1063,14 +1064,28 @@ export function klineStyles(p: Palette, _coordType: CoordType = 'normal'): Recor
  * purpose so the model is not blamed for client-invented numbers — the card
  * still needs series for MACD/Stoch/ADX/MFI/BB chips, so we compute locally.
  */
+// Candle and series arrays are immutable snapshots. Weak keys release all derived
+// data with the chart payload, instead of retaining every live tick in a Map.
+const snapshotCache = new WeakMap<ChartTimeframeData['candles'], NonNullable<ChartTimeframeData['indicators']>>()
+const regimeSeriesCache = new WeakMap<ChartTimeframeData['candles'], NonNullable<ChartTimeframeData['series']>>()
+const chipRowsCache = new WeakMap<NonNullable<ChartTimeframeData['series']>, Map<string, Record<string, number | undefined>[]>>()
+
 export function enrichChartTimeframe(tf: ChartTimeframeData): ChartTimeframeData {
   if (tf.candles.length === 0) return tf
   const seriesOk = tf.series !== undefined
     && tf.series['rsi14']?.length === tf.candles.length
   if (tf.indicators !== null && seriesOk) return tf
   try {
-    const indicators = tf.indicators ?? regimeSnapshot(tf.candles)
-    const series = seriesOk ? tf.series : regimeSeries(tf.candles)
+    let indicators = tf.indicators ?? snapshotCache.get(tf.candles)
+    if (indicators === undefined) {
+      indicators = regimeSnapshot(tf.candles)
+      snapshotCache.set(tf.candles, indicators)
+    }
+    let series = seriesOk ? tf.series : regimeSeriesCache.get(tf.candles)
+    if (series === undefined) {
+      series = regimeSeries(tf.candles)
+      regimeSeriesCache.set(tf.candles, series)
+    }
     return { ...tf, indicators, series }
   } catch {
     return tf
@@ -1079,14 +1094,26 @@ export function enrichChartTimeframe(tf: ChartTimeframeData): ChartTimeframeData
 
 /** Map payload series onto klinecharts rows for one chip's figures. */
 export function seriesRows(data: ChartTimeframeData, figures: Record<string, string>): Record<string, number | undefined>[] {
-  return data.candles.map((_, i) => {
+  const entries = Object.entries(figures)
+  const key = JSON.stringify([data.candles.length, entries])
+  let cache = data.series === undefined ? undefined : chipRowsCache.get(data.series)
+  const cached = cache?.get(key)
+  if (cached !== undefined) return cached
+  const rows = data.candles.map((_, i) => {
     const row: Record<string, number | undefined> = {}
-    for (const [figKey, seriesKey] of Object.entries(figures)) {
+    for (const [figKey, seriesKey] of entries) {
       const v = data.series?.[seriesKey]?.[i]
       row[figKey] = typeof v === 'number' && Number.isFinite(v) ? v : undefined
     }
     return row
   })
+  if (data.series !== undefined) {
+    if (cache === undefined) { cache = new Map(); chipRowsCache.set(data.series, cache) }
+    // Only a handful of chip mappings are needed for one immutable series.
+    if (cache.size >= 32) cache.delete(cache.keys().next().value!)
+    cache.set(key, rows)
+  }
+  return rows
 }
 
 function hasSeries(data: ChartTimeframeData, figures: Record<string, string>): boolean {
@@ -1456,7 +1483,7 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
         }
         continue
       }
-      createIndicatorInPane(chart, { name: def.name, calcParams: s.params, visible: s.visible, extendData: ext }, { paneId: 'candle_pane', isStack: true })
+      syncIndicatorInPane(chart, { name: def.name, calcParams: s.params, extendData: ext }, s.visible, { paneId: 'candle_pane', isStack: true })
     }
     const onFeatureClick = (data: unknown) => {
       const d = data as { feature?: { id?: string } } | undefined
@@ -1668,7 +1695,7 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
         }
         continue
       }
-      overrideInd(chart, { name: def.name, calcParams: s.params, visible: s.visible, extendData: ext }, 'candle_pane')
+      syncIndicatorInPane(chart, { name: def.name, calcParams: s.params, extendData: ext }, s.visible, { paneId: 'candle_pane', isStack: true })
     }
   }, [settings, derivatives, cvd, data.timeframe, dark])
 

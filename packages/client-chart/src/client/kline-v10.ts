@@ -119,8 +119,59 @@ export function removeIndicator(chart: Chart, paneId: string, name: string): boo
   return chart.removeIndicator({ paneId, name })
 }
 
+/** Compare small configuration records; large immutable history arrays use identity. */
+function sameIndicatorInput(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) || Array.isArray(b)) return false
+  const aa = Object.entries(a)
+  const bb = Object.entries(b)
+  return aa.length === bb.length && aa.every(([key, value]) => Object.hasOwn(b, key) && Object.is(value, (b as Record<string, unknown>)[key]))
+}
+
+// klinecharts clones extendData on create/override. Remember the original immutable
+// input per live instance instead of comparing its history with the engine clone.
+const indicatorInputs = new WeakMap<Indicator, { input: unknown; stored: unknown }>()
+
+function rememberIndicatorInput(chart: Chart, value: IndicatorCreate): void {
+  if (value.extendData === undefined) return
+  for (const ind of chart.getIndicators({ name: value.name, ...(value.paneId ? { paneId: value.paneId } : {}) })) {
+    indicatorInputs.set(ind, { input: value.extendData, stored: ind.extendData })
+  }
+}
+
 export function overrideIndicator(chart: Chart, override: IndicatorCreate, paneId?: string): boolean {
-  return chart.overrideIndicator(paneId ? { ...override, paneId } : override)
+  const value = paneId ? { ...override, paneId } : override
+  const current = chart.getIndicators({ name: value.name, ...(value.paneId ? { paneId: value.paneId } : {}) })
+  if (current.length > 0 && current.every(ind => Object.entries(value).every(([key, next]) => {
+    if (next === undefined) return true // engine treats undefined as not provided
+    const remembered = key === 'extendData' ? indicatorInputs.get(ind) : undefined
+    const prev = remembered && Object.is(remembered.stored, ind.extendData)
+      ? remembered.input : (ind as unknown as Record<string, unknown>)[key]
+    if (key === 'calcParams' && Array.isArray(prev) && Array.isArray(next)) {
+      return prev.length === next.length && prev.every((v, i) => Object.is(v, next[i]))
+    }
+    return sameIndicatorInput(prev, next)
+  }))) return false
+  const updated = chart.overrideIndicator(value)
+  // A false return can still mean calc was scheduled (no synchronous redraw).
+  rememberIndicatorInput(chart, value)
+  return updated
+}
+
+/** Hidden indicators must leave the engine, not merely stop painting. Returns true on creation. */
+export function syncIndicatorInPane(
+  chart: Chart,
+  value: IndicatorCreate,
+  visible: boolean,
+  opts: { paneId: string; isStack?: boolean; height?: number },
+): boolean {
+  const exists = hasIndicator(chart, opts.paneId, value.name)
+  if (!visible) {
+    if (exists) removeIndicator(chart, opts.paneId, value.name)
+    return false
+  }
+  if (exists) { overrideIndicator(chart, value, opts.paneId); return false }
+  return createIndicatorInPane(chart, value, opts) !== null
 }
 
 /**
@@ -134,6 +185,7 @@ export function createIndicatorInPane(
 ): string | null {
   const create: IndicatorCreate = typeof value === 'string' ? { name: value, paneId: opts.paneId } : { ...value, paneId: opts.paneId }
   const id = chart.createIndicator(create, opts.isStack === true)
+  if (id !== null) rememberIndicatorInput(chart, create)
   if (opts.height !== undefined && opts.paneId !== 'candle_pane') {
     try { chart.setPaneOptions({ id: opts.paneId, height: opts.height }) } catch { /* pane may already exist */ }
   }

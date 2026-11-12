@@ -8,13 +8,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "pnpm -r run build",
-    "typecheck": "pnpm -r run typecheck",
+    "build": "pnpm run check:deps && pnpm -r run build",
+    "typecheck": "pnpm run check:deps && pnpm -r run typecheck",
     "test": "vitest run",
+    "check:deps": "node scripts/dependency-identity.mjs",
     "check:boundary": "node scripts/boundary-check.mjs",
     "check:tools": "node scripts/tools-audit.mjs",
     "check:home": "node scripts/home-guard.mjs",
-    "audit:all": "pnpm run check:boundary && pnpm run check:tools && pnpm run check:home",
+    "audit:all": "pnpm run check:deps && pnpm run check:boundary && pnpm run check:tools && pnpm run check:home",
     "clean": "pnpm -r exec rm -rf lib"
   },
   "devDependencies": {
