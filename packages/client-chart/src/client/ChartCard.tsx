@@ -63,6 +63,7 @@ import { detectPricePrecision, formatPrice } from './precision.js'
 import { createAnnotationOverlays, hitDots, tradeTimeText } from './annotation-overlays.js'
 import { registerProOverlays } from './overlays/index.js'
 import { createMainPaneTooltipFold, SUBPLOT_TOOLTIP } from './indicator-tooltip.js'
+import { initialChartMount, observeNearViewport } from './viewport-lifecycle.js'
 
 export { evasiveSuperTrend } from './indicators/evasive-st.js'
 export { nadarayaWatsonTrend } from './indicators/nadaraya-watson.js'
@@ -3141,6 +3142,32 @@ export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, 
   )
 }
 
+/** Only tool-call cards use this gate; the persistent panel stays mounted. */
+function ViewportChartCard({ payload }: { payload: ChartPayload }): JSX.Element {
+  const root = useRef<HTMLDivElement>(null)
+  const [near, setNear] = useState(() => initialChartMount(typeof IntersectionObserver !== 'undefined'))
+  const [parkedHeight, setParkedHeight] = useState(0)
+
+  useEffect(() => {
+    const target = root.current
+    if (target === null) return
+    return observeNearViewport(target, (visible, height) => {
+      if (!visible && height !== undefined && height > 0) setParkedHeight(height)
+      setNear(current => current === visible ? current : visible)
+    })
+  }, [])
+
+  return (
+    <div ref={root} data-chart-card-viewport style={near ? undefined : { height: Math.max(parkedHeight, CHART_HEIGHT), boxSizing: 'border-box' }}>
+      {near ? <ChartBody payload={payload} /> : (
+        <div style={{ ...SHELL, boxSizing: 'border-box', height: '100%', margin: 0 }}>
+          {payload.symbol} · 图表已暂停，滚动至附近恢复
+        </div>
+      )}
+    </div>
+  )
+}
+
 /**
  * The tool-call seat's adapter: unwrap a `market_snapshot` / `get_ohlcv` /
  * `annotate_chart` result into a payload and hand it to {@link ChartBody},
@@ -3174,5 +3201,5 @@ export function ChartCard(props: ToolCallViewProps): JSX.Element {
   if (payload === null) {
     return <Fallback text={contentText(block.content)} error={false} />
   }
-  return <ChartBody payload={payload} />
+  return <ViewportChartCard payload={payload} />
 }
