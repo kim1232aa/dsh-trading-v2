@@ -52,3 +52,41 @@ export function subscribeLatestChart(listener: Listener): () => void {
 export function getLatestChart(): ChartPayload | null {
   return latest
 }
+
+/**
+ * Whether the trading frame's chart column is on screen. Cards in the chat
+ * read it: with the column open the chart lives there, so a card collapses to
+ * a one-line receipt instead of mounting a second chart.
+ */
+let columnOpen = false
+const columnListeners = new Set<Listener>()
+
+/**
+ * The chart column reports whether it is open (width above zero).
+ * @param open - true while the column has a non-zero width.
+ */
+export function setColumnOpen(open: boolean): void {
+  if (columnOpen === open) return
+  columnOpen = open
+  for (const listener of columnListeners) listener()
+}
+
+/**
+ * Subscribe to column open/closed changes (the `useSyncExternalStore` subscribe half).
+ * @param listener - called after each change.
+ * @returns unsubscribe.
+ */
+export function subscribeColumn(listener: Listener): () => void {
+  columnListeners.add(listener)
+  return () => {
+    columnListeners.delete(listener)
+  }
+}
+
+/**
+ * Read whether the column is open (the `useSyncExternalStore` snapshot half).
+ * @returns true while the chart column is on screen.
+ */
+export function getColumnOpen(): boolean {
+  return columnOpen
+}

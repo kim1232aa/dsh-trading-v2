@@ -6,7 +6,9 @@
  * stable between publishes or `useSyncExternalStore` will loop forever.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getLatestChart, publishLatestChart, subscribeLatestChart } from '../src/client/latest.js'
+import {
+  getColumnOpen, getLatestChart, publishLatestChart, setColumnOpen, subscribeColumn, subscribeLatestChart,
+} from '../src/client/latest.js'
 import { annotationDigest } from '../src/client/payload.js'
 import type { ChartPayload } from '../src/client/payload.js'
 
@@ -113,5 +115,32 @@ describe('annotationDigest', () => {
 
   it('is stable for equal content', () => {
     expect(annotationDigest([], [])).toBe(annotationDigest(undefined, undefined))
+  })
+})
+
+describe('chart column open state', () => {
+  beforeEach(() => setColumnOpen(false))
+
+  it('starts closed', () => {
+    expect(getColumnOpen()).toBe(false)
+  })
+
+  it('notifies subscribers only when the value changes', () => {
+    const listener = vi.fn()
+    const off = subscribeColumn(listener)
+    setColumnOpen(true)
+    setColumnOpen(true)
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(getColumnOpen()).toBe(true)
+    setColumnOpen(false)
+    expect(listener).toHaveBeenCalledTimes(2)
+    off()
+  })
+
+  it('stops notifying after unsubscribe', () => {
+    const listener = vi.fn()
+    subscribeColumn(listener)()
+    setColumnOpen(true)
+    expect(listener).not.toHaveBeenCalled()
   })
 })
