@@ -1640,9 +1640,6 @@ function ChartPanelInner({ width, market, ask, feed }: ChartOwnerProps & ChartPa
     } else if (newProvider === 'binance' && (!targetSymbol || /^(sh|sz)?\d{6}$/i.test(targetSymbol))) {
       targetSymbol = 'ETHUSDT'
       setDraft('ETHUSDT')
-    } else if (newProvider === 'public' && (!targetSymbol || /^(sh|sz|bj)?\d{6}$/i.test(targetSymbol))) {
-      targetSymbol = 'AAPL'
-      setDraft('AAPL')
     }
     if (targetSymbol !== '') {
       setPinned(true)
@@ -1750,7 +1747,7 @@ function ChartPanelInner({ width, market, ask, feed }: ChartOwnerProps & ChartPa
           <option value="auto">源: 自动</option>
           {availableProviders.map(p => (
             <option key={p.id} value={p.id}>
-              源: {p.id === 'binance' ? 'Binance' : p.id === 'cn' ? '东财/新浪A股' : p.id === 'public' ? 'Yahoo (美港股/全球)' : p.description || p.id}
+              源: {p.id === 'binance' ? 'Binance' : p.id === 'cn' ? '东财/新浪A股' : p.description || p.id}
             </option>
           ))}
         </select>

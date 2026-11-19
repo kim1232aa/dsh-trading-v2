@@ -20,6 +20,9 @@ importers:
       '@dsh-trading/client-chart':
         specifier: workspace:^
         version: link:../../packages/client-chart
+      '@dsh-trading/client-frame':
+        specifier: workspace:^
+        version: link:../../packages/client-frame
       '@dsh-trading/holdings':
         specifier: workspace:^
         version: link:../../packages/holdings
@@ -29,12 +32,15 @@ importers:
       '@dsh-trading/market-data':
         specifier: workspace:^
         version: link:../../packages/market-data
+      '@dsh-trading/provider-binance':
+        specifier: workspace:^
+        version: link:../../packages/provider-binance
+      '@dsh-trading/provider-cn':
+        specifier: workspace:^
+        version: link:../../packages/provider-cn
       '@dsh-trading/provider-csv':
         specifier: workspace:^
         version: link:../../packages/provider-csv
-      '@dsh-trading/provider-public':
-        specifier: workspace:^
-        version: link:../../packages/provider-public
       '@dsh-trading/risk-guard':
         specifier: workspace:^
         version: link:../../packages/risk-guard
@@ -289,24 +295,6 @@ importers:
       futu-api:
         specifier: 10.9.6908
         version: 10.9.6908
-      typescript:
-        specifier: ^5.7.2
-        version: 5.9.3
-
-  packages/provider-public:
-    devDependencies:
-      '@deepseek-ai/cordis':
-        specifier: ^4.0.4
-        version: 4.0.4
-      '@deepseek-ai/schemastery':
-        specifier: ^3.18.1
-        version: 3.18.4
-      '@dsh-trading/market-data':
-        specifier: workspace:^
-        version: link:../market-data
-      '@types/node':
-        specifier: ^22.10.0
-        version: 22.20.1
       typescript:
         specifier: ^5.7.2
         version: 5.9.3

@@ -73,10 +73,6 @@
 # are opt-in. ctx.marketData holds several providers, so add them BESIDE
 # market-data-provider from your own profile patch — see README "Design".
 # provider-coinglass exposes ctx.coinglass for large_orders + 大单墙 overlay.
-# provider-public is keyless (Yahoo Finance): US/HK equities, indices, futures,
-# FX and a fallback for broker-format codes. Mount it BESIDE the crypto/CN
-# providers and keep defaultProvider on binance; resolve_symbol / search route
-# binance -> cn -> public, so every hit carries the feed that serves it.
 
 # Agent presets (shipped with the bundle — selectable in the session picker).
 # Official path: @deepseek-ai/dsh-agent-preset declaration rows. Directory-based
