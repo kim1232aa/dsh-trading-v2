@@ -174,6 +174,83 @@ export function isBinanceSymbol(raw: string): boolean {
   return COMMON_QUOTES.some(q => s.length > q.length && s.endsWith(q))
 }
 
+
+const CRYPTO_SEARCH_ALIASES: Record<string, { symbol: string; name: string }> = {
+  比特币: { symbol: 'BTCUSDT', name: 'Bitcoin' },
+  大饼: { symbol: 'BTCUSDT', name: 'Bitcoin' },
+  bitcoin: { symbol: 'BTCUSDT', name: 'Bitcoin' },
+  btc: { symbol: 'BTCUSDT', name: 'Bitcoin' },
+  以太坊: { symbol: 'ETHUSDT', name: 'Ethereum' },
+  以太币: { symbol: 'ETHUSDT', name: 'Ethereum' },
+  以太: { symbol: 'ETHUSDT', name: 'Ethereum' },
+  ethereum: { symbol: 'ETHUSDT', name: 'Ethereum' },
+  eth: { symbol: 'ETHUSDT', name: 'Ethereum' },
+  索拉纳: { symbol: 'SOLUSDT', name: 'Solana' },
+  solana: { symbol: 'SOLUSDT', name: 'Solana' },
+  sol: { symbol: 'SOLUSDT', name: 'Solana' },
+  币安币: { symbol: 'BNBUSDT', name: 'BNB' },
+  bnb: { symbol: 'BNBUSDT', name: 'BNB' },
+  瑞波: { symbol: 'XRPUSDT', name: 'XRP' },
+  瑞波币: { symbol: 'XRPUSDT', name: 'XRP' },
+  xrp: { symbol: 'XRPUSDT', name: 'XRP' },
+  狗狗币: { symbol: 'DOGEUSDT', name: 'Dogecoin' },
+  dogecoin: { symbol: 'DOGEUSDT', name: 'Dogecoin' },
+  doge: { symbol: 'DOGEUSDT', name: 'Dogecoin' },
+  艾达: { symbol: 'ADAUSDT', name: 'Cardano' },
+  cardano: { symbol: 'ADAUSDT', name: 'Cardano' },
+  ada: { symbol: 'ADAUSDT', name: 'Cardano' },
+  雪崩: { symbol: 'AVAXUSDT', name: 'Avalanche' },
+  avalanche: { symbol: 'AVAXUSDT', name: 'Avalanche' },
+  avax: { symbol: 'AVAXUSDT', name: 'Avalanche' },
+  link: { symbol: 'LINKUSDT', name: 'Chainlink' },
+  chainlink: { symbol: 'LINKUSDT', name: 'Chainlink' },
+  莱特币: { symbol: 'LTCUSDT', name: 'Litecoin' },
+  litecoin: { symbol: 'LTCUSDT', name: 'Litecoin' },
+  ltc: { symbol: 'LTCUSDT', name: 'Litecoin' },
+  sui: { symbol: 'SUIUSDT', name: 'Sui' },
+  pepe: { symbol: 'PEPEUSDT', name: 'Pepe' },
+  arb: { symbol: 'ARBUSDT', name: 'Arbitrum' },
+  op: { symbol: 'OPUSDT', name: 'Optimism' },
+  ton: { symbol: 'TONUSDT', name: 'Toncoin' },
+  apt: { symbol: 'APTUSDT', name: 'Aptos' },
+  uni: { symbol: 'UNIUSDT', name: 'Uniswap' },
+  near: { symbol: 'NEARUSDT', name: 'NEAR Protocol' },
+  tao: { symbol: 'TAOUSDT', name: 'Bittensor' },
+}
+
+function searchCryptoCatalog(
+  query: string,
+  catalog: readonly string[],
+  timeframes: readonly Timeframe[],
+): InstrumentInfo[] {
+  const raw = query.trim()
+  if (!raw) return []
+  const upper = raw.toUpperCase()
+  if (/^\d{6}$/.test(upper) || /^(SH|SZ|BJ)\d{6}$/.test(upper) || /^\d{6}(SH|SZ|BJ)$/.test(upper)) return []
+  if (/^(US|HK|SH|SZ|JP|CC)\./.test(upper) || /\.(HK|SS|SZ|TW|T|L)$/.test(upper) || upper.includes('=') || upper.startsWith('^') || /^[A-Z0-9]{2,10}-[A-Z]{2,6}$/.test(upper)) {
+    return []
+  }
+  const set = new Set(catalog)
+  const out: InstrumentInfo[] = []
+  const seen = new Set<string>()
+  const push = (symbol: string, name?: string) => {
+    if (!set.has(symbol) || seen.has(symbol)) return
+    seen.add(symbol)
+    out.push({ symbol, ...(name ? { name } : {}), assetClass: 'crypto', timeframes: [...timeframes] })
+  }
+  const alias = CRYPTO_SEARCH_ALIASES[raw.toLowerCase()]
+  if (alias !== undefined) push(alias.symbol, alias.name)
+  const compact = upper.replace(/[/\-_\s]/g, '')
+  if (compact) {
+    if (set.has(compact)) push(compact)
+    const normalized = normalizeSymbol(raw)
+    if (set.has(normalized)) push(normalized)
+    for (const sym of catalog) {
+      if (sym.startsWith(compact) || sym.includes(compact)) push(sym)
+    }
+  }
+  return out.slice(0, 8)
+}
 export class BinanceProvider implements MarketDataProvider {
   readonly id: string
   readonly description: string
@@ -193,7 +270,11 @@ export class BinanceProvider implements MarketDataProvider {
   }
 
   async listSymbols(): Promise<InstrumentInfo[]> {
-    return this.symbols.map(symbol => ({ symbol, timeframes: [...ALL_TIMEFRAMES] }))
+    return this.symbols.map(symbol => ({ symbol, assetClass: 'crypto', timeframes: [...ALL_TIMEFRAMES] }))
+  }
+
+  async search(query: string): Promise<InstrumentInfo[]> {
+    return searchCryptoCatalog(query, this.symbols, ALL_TIMEFRAMES)
   }
 
   async getOhlcv(query: OhlcvQuery): Promise<Candle[]> {
@@ -1509,7 +1590,11 @@ export class OkxMarketProvider implements MarketDataProvider {
   }
 
   async listSymbols(): Promise<InstrumentInfo[]> {
-    return this.symbols.map(symbol => ({ symbol, timeframes: [...OKX_TIMEFRAMES] }))
+    return this.symbols.map(symbol => ({ symbol, assetClass: 'crypto', timeframes: [...OKX_TIMEFRAMES] }))
+  }
+
+  async search(query: string): Promise<InstrumentInfo[]> {
+    return searchCryptoCatalog(query, this.symbols, OKX_TIMEFRAMES)
   }
 
   async getOhlcv(query: OhlcvQuery): Promise<Candle[]> {

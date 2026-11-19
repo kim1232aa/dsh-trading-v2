@@ -205,6 +205,43 @@ export function parseTencentQuote(raw: string, symbol: string): {
   }
 }
 
+const CN_SEARCH_ALIASES: Record<string, { symbol: string; name: string; assetClass: 'equity' | 'index' }> = {
+  上证指数: { symbol: 'sh000001', name: '上证指数', assetClass: 'index' },
+  上证: { symbol: 'sh000001', name: '上证指数', assetClass: 'index' },
+  大盘: { symbol: 'sh000001', name: '上证指数', assetClass: 'index' },
+  深证成指: { symbol: 'sz399001', name: '深证成指', assetClass: 'index' },
+  深成指: { symbol: 'sz399001', name: '深证成指', assetClass: 'index' },
+  创业板指: { symbol: 'sz399006', name: '创业板指', assetClass: 'index' },
+  创业板: { symbol: 'sz399006', name: '创业板指', assetClass: 'index' },
+  科创50: { symbol: 'sh000688', name: '科创50', assetClass: 'index' },
+  科创板: { symbol: 'sh000688', name: '科创50', assetClass: 'index' },
+  沪深300: { symbol: 'sh000300', name: '沪深300', assetClass: 'index' },
+  中证500: { symbol: 'sh000905', name: '中证500', assetClass: 'index' },
+  贵州茅台: { symbol: '600519', name: '贵州茅台', assetClass: 'equity' },
+  茅台: { symbol: '600519', name: '贵州茅台', assetClass: 'equity' },
+  maotai: { symbol: '600519', name: '贵州茅台', assetClass: 'equity' },
+  平安银行: { symbol: '000001', name: '平安银行', assetClass: 'equity' },
+  宁德时代: { symbol: '300750', name: '宁德时代', assetClass: 'equity' },
+  宁王: { symbol: '300750', name: '宁德时代', assetClass: 'equity' },
+  中芯国际: { symbol: '688981', name: '中芯国际', assetClass: 'equity' },
+  比亚迪: { symbol: '002594', name: '比亚迪', assetClass: 'equity' },
+  中国平安: { symbol: '601318', name: '中国平安', assetClass: 'equity' },
+  紫金矿业: { symbol: '601899', name: '紫金矿业', assetClass: 'equity' },
+  美的集团: { symbol: '000333', name: '美的集团', assetClass: 'equity' },
+  万达轴承: { symbol: '920002', name: '万达轴承', assetClass: 'equity' },
+}
+
+function normaliseCnCandidate(raw: string): string {
+  const trimmed = raw.trim().toUpperCase()
+  const broker = /^(SH|SZ|BJ)\.(\d{6})$/.exec(trimmed)
+  if (broker !== null) return `${broker[1]!.toLowerCase()}${broker[2]!}`
+  const suffixed = /^(\d{6})\.(SS|SH|SZ|BJ)$/.exec(trimmed)
+  if (suffixed !== null) {
+    const mkt = suffixed[2] === 'SS' ? 'sh' : suffixed[2]!.toLowerCase()
+    return `${mkt}${suffixed[1]!}`
+  }
+  return raw.trim()
+}
 export class CnMarketProvider implements MarketDataProvider {
   readonly id: string
   readonly description: string
@@ -254,6 +291,57 @@ export class CnMarketProvider implements MarketDataProvider {
 
   async listSymbols(): Promise<InstrumentInfo[]> {
     return this.representativeSymbols
+  }
+
+  private readonly suggestCache = new Map<string, { at: number; items: InstrumentInfo[] }>()
+
+  async search(query: string): Promise<InstrumentInfo[]> {
+    const q = query.trim()
+    if (q.length === 0 || q.length > 40) return []
+    const alias = CN_SEARCH_ALIASES[q.toLowerCase()] ?? CN_SEARCH_ALIASES[q]
+    if (alias !== undefined) {
+      return [{ symbol: alias.symbol, name: alias.name, assetClass: alias.assetClass, timeframes: [...ALL_CN_TIMEFRAMES] }]
+    }
+    try {
+      const normalized = normaliseCnCandidate(q)
+      const info = parseCnSymbol(normalized)
+      const rep = this.representativeSymbols.find(item => item.symbol.toLowerCase() === info.code || item.symbol.toLowerCase() === info.sinaSymbol)
+      if (rep !== undefined) {
+        const name = (rep as InstrumentInfo & { description?: string }).description?.split(' (')[0]
+        return [{ symbol: rep.symbol, ...(name ? { name } : {}), assetClass: rep.assetClass ?? 'equity', timeframes: [...ALL_CN_TIMEFRAMES] }]
+      }
+      const symbol = info.code.startsWith('000') && info.market === 'sh' ? info.sinaSymbol : info.code
+      return [{ symbol, assetClass: 'equity', timeframes: [...ALL_CN_TIMEFRAMES] }]
+    } catch {
+      // Fall through to Chinese stock suggest lookup
+    }
+    if (!/[\u4e00-\u9fff]/.test(q)) return []
+    const cached = this.suggestCache.get(q)
+    if (cached !== undefined && Date.now() - cached.at < 60_000) return cached.items
+    try {
+      const url = `https://searchapi.eastmoney.com/api/suggest/get?input=${encodeURIComponent(q)}&type=14&count=8`
+      const res = await fetch(url, { signal: AbortSignal.timeout(Math.min(this.timeoutMs, 4000)) })
+      if (!res.ok) return []
+      const body = (await res.json()) as { QuotationCodeTable?: { Data?: Array<{ Code?: string; Name?: string; MktNum?: string; SecurityTypeName?: string }> } }
+      const items: InstrumentInfo[] = []
+      for (const row of body.QuotationCodeTable?.Data ?? []) {
+        const code = row.Code?.trim() ?? ''
+        const name = row.Name?.trim() ?? ''
+        const sec = row.SecurityTypeName ?? ''
+        if (!/^\d{6}$/.test(code)) continue
+        const isCnBoard = row.MktNum === '0' || row.MktNum === '1' || /沪|深|京|科创|创业/.test(sec)
+        if (!isCnBoard) continue
+        const isIdx = /指数/.test(sec)
+        const symbol = isIdx ? `${row.MktNum === '1' ? 'sh' : 'sz'}${code}` : code
+        items.push({ symbol, ...(name ? { name } : {}), assetClass: isIdx ? 'index' : 'equity', timeframes: [...ALL_CN_TIMEFRAMES] })
+        if (items.length >= 8) break
+      }
+      this.suggestCache.set(q, { at: Date.now(), items })
+      if (this.suggestCache.size > 100) this.suggestCache.delete(this.suggestCache.keys().next().value as string)
+      return items
+    } catch {
+      return []
+    }
   }
 
   async getOhlcv(query: OhlcvQuery): Promise<Candle[]> {
