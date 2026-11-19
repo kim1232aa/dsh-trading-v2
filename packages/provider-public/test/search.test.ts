@@ -31,12 +31,35 @@ afterEach(() => {
 })
 
 describe('search', () => {
-  it('answers a Chinese name from the local table, without touching the network', async () => {
+  it('answers a Chinese name from the local table with canonical display names, without touching the network', async () => {
     const fetch = vi.fn()
     vi.stubGlobal('fetch', fetch)
-    const hits = await mount().search?.('腾讯')
+    const provider = mount()
+    const hits = await provider.search?.('腾讯')
     expect(hits?.[0]?.symbol).toBe('0700.HK')
+    expect(hits?.[0]?.name).toBe('腾讯控股')
+    const maotai = await provider.search?.('茅台')
+    expect(maotai?.[0]?.symbol).toBe('600519.SS')
+    expect(maotai?.[0]?.name).toBe('贵州茅台')
+    const sse = await provider.search?.('上证')
+    expect(sse?.[0]?.symbol).toBe('000001.SS')
+    expect(sse?.[0]?.name).toBe('上证指数')
+    // Containment match inside an A-share index name must not claim that index name as its own name
+    const containment = await provider.search?.('腾讯济安')
+    expect(containment?.[0]?.symbol).toBe('0700.HK')
+    expect(containment?.[0]?.name).toBe('腾讯控股')
     expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('classifies alias targets by symbol shape so ranking can tell an index from a share', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    const provider = mount()
+    expect((await provider.search?.('上证'))?.[0]?.assetClass).toBe('index')
+    expect((await provider.search?.('沪深300'))?.[0]?.assetClass).toBe('index')
+    expect((await provider.search?.('恒指'))?.[0]?.assetClass).toBe('index')
+    expect((await provider.search?.('黄金'))?.[0]?.assetClass).toBe('future')
+    expect((await provider.search?.('比特币'))?.[0]?.assetClass).toBe('crypto')
+    expect((await provider.search?.('腾讯'))?.[0]?.assetClass).toBe('equity')
   })
 
   it('rewrites broker notation into this feed notation', async () => {

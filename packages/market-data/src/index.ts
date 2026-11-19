@@ -194,7 +194,7 @@ export class MarketData extends Service {
         const res = results[i]!
         if (res.status === 'fulfilled') groups.push({ providerId: searchable[i]!.id, items: res.value })
       }
-      return deduplicateHits(groups)
+      return rankSearchHits(query, deduplicateHits(groups))
     })
   }
 
@@ -205,6 +205,27 @@ export class MarketData extends Service {
   search(query: string, providerId?: string): Promise<InstrumentInfo[]> {
     return this.searchWithProvider(query, providerId).then(hits => hits.map(h => h.item))
   }
+}
+
+/**
+ * Rank multi-provider hits by match precision while keeping SEARCH_PRIORITY order
+ * as tie-breaker: exact symbol -> exact name -> non-index before partial index -> prefix.
+ */
+function rankSearchHits(query: string, hits: readonly SearchHit[]): SearchHit[] {
+  const q = query.trim().toLowerCase()
+  if (!q || hits.length <= 1) return [...hits]
+  const score = (hit: SearchHit): [number, number, number] => {
+    const sym = hit.item.symbol.trim().toLowerCase()
+    const name = (hit.item.name ?? '').trim().toLowerCase()
+    const exactTier = sym === q ? 0 : name === q ? 1 : 2
+    const indexPenalty = hit.item.assetClass === 'index' && exactTier === 2 ? 1 : 0
+    const prefixTier = name.startsWith(q) || sym.startsWith(q) ? 0 : 1
+    return [exactTier, indexPenalty, prefixTier]
+  }
+  return hits
+    .map((hit, idx) => ({ hit, idx, key: score(hit) }))
+    .sort((a, b) => (a.key[0] - b.key[0]) || (a.key[1] - b.key[1]) || (a.key[2] - b.key[2]) || (a.idx - b.idx))
+    .map(entry => entry.hit)
 }
 
 function deduplicateHits(groups: readonly { providerId: string; items: readonly InstrumentInfo[] }[]): SearchHit[] {

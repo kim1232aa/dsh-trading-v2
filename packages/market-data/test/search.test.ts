@@ -81,6 +81,44 @@ describe('MarketData search routing', () => {
     ])
   })
 
+  it('prefers equity/exact matches over non-exact cn index hits like 腾讯 -> 腾讯济安, while preserving cn priority for indices/A-shares', async () => {
+    const hub = new MarketData(new Context(), { defaultProvider: 'binance' })
+    hub.register(baseProvider('binance', async () => []))
+    hub.register(baseProvider('cn', async (q) => {
+      if (q === '腾讯' || q === '腾讯济安') return [{ symbol: 'sh000847', name: '腾讯济安', assetClass: 'index' }]
+      if (q === '上证') return [{ symbol: 'sh000001', name: '上证指数', assetClass: 'index' }]
+      if (q === '茅台') return [{ symbol: '600519', name: '贵州茅台', assetClass: 'equity' }]
+      if (q === '京东') return [{ symbol: '000725', name: '京东方A', assetClass: 'equity' }]
+      return []
+    }))
+    hub.register(baseProvider('public', async (q) => {
+      if (q === '腾讯' || q === '腾讯济安') return [{ symbol: '0700.HK', name: '腾讯控股', assetClass: 'equity' }]
+      if (q === '上证') return [{ symbol: '000001.SS', name: '上证指数', assetClass: 'index' }]
+      if (q === '茅台') return [{ symbol: '600519.SS', name: '贵州茅台', assetClass: 'equity' }]
+      if (q === '京东') return [{ symbol: 'JD', name: '京东', assetClass: 'equity' }]
+      return []
+    }))
+
+    const tencentHits = await hub.searchWithProvider('腾讯')
+    expect(tencentHits.map(h => `${h.providerId}:${h.item.symbol}`)).toEqual(['public:0700.HK', 'cn:sh000847'])
+
+    const tencentIndexHits = await hub.searchWithProvider('腾讯济安')
+    expect(tencentIndexHits[0]?.providerId).toBe('cn')
+    expect(tencentIndexHits[0]?.item.symbol).toBe('sh000847')
+
+    const sseHits = await hub.searchWithProvider('上证')
+    expect(sseHits[0]?.providerId).toBe('cn')
+    expect(sseHits[0]?.item.symbol).toBe('sh000001')
+
+    const maotaiHits = await hub.searchWithProvider('茅台')
+    expect(maotaiHits[0]?.providerId).toBe('cn')
+    expect(maotaiHits[0]?.item.symbol).toBe('600519')
+
+    const jdHits = await hub.searchWithProvider('京东')
+    expect(jdHits[0]?.providerId).toBe('public')
+    expect(jdHits[0]?.item.symbol).toBe('JD')
+  })
+
   it('propagates errors when an explicit providerId search fails', async () => {
     const hub = new MarketData(new Context())
     hub.register(baseProvider('public', async () => {

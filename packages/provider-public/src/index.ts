@@ -209,6 +209,49 @@ const NAME_ALIASES: Record<string, string> = {
   hushen300: '000300.SS', csi300: '000300.SS', shangzheng: '000001.SS',
 }
 
+/**
+ * Canonical names for short/overlapping Chinese aliases so multi-provider ranking
+ * can distinguish e.g. 腾讯控股 (equity) from 腾讯济安 (A-share index) and avoid
+ * hijacking 茅台/上证/比特币 from higher-priority cn/binance providers.
+ */
+const CANONICAL_ALIAS_NAMES: Record<string, string> = {
+  maotai: '贵州茅台',
+  腾讯: '腾讯控股',
+  阿里: '阿里巴巴',
+  茅台: '贵州茅台',
+  平安: '中国平安',
+  中芯: '中芯国际',
+  汇丰: '汇丰控股',
+  友邦: '友邦保险',
+  上证: '上证指数',
+  标普: '标普500',
+  道指: '道琼斯',
+  恒指: '恒生指数',
+  恒生: '恒生指数',
+  比特币: 'Bitcoin',
+  大饼: 'Bitcoin',
+  以太坊: 'Ethereum',
+  以太币: 'Ethereum',
+  索拉纳: 'Solana',
+}
+
+/** Alias targets that are indices even though their Yahoo spelling looks like a listing. */
+const INDEX_SYMBOLS = new Set(['000001.SS', '000300.SS'])
+
+/**
+ * Asset class of an alias target the catalogue does not list, read off the
+ * symbol shape. Cross-provider ranking keys on it: calling 上证 an equity would
+ * let it outrank the A-share index of the same name.
+ */
+function inferAssetClass(symbol: string): string {
+  const s = symbol.toUpperCase()
+  if (s.startsWith('^') || INDEX_SYMBOLS.has(s)) return 'index'
+  if (s.endsWith('=F')) return 'future'
+  if (s.endsWith('=X')) return 'fx'
+  if (s.endsWith('-USD')) return 'crypto'
+  return 'equity'
+}
+
 /** Quote types the chart endpoint can actually serve. */
 const ASSET_CLASS: Record<string, string> = {
   EQUITY: 'equity',
@@ -262,9 +305,14 @@ class PublicProvider implements MarketDataProvider {
       item.symbol.toUpperCase() === raw.toUpperCase()
       || (item.name ?? '').toLowerCase() === raw.toLowerCase())
     if (direct !== undefined) return direct
-    const aliased = NAME_ALIASES[raw] ?? this.byContainment(raw)
+    const exactKey = NAME_ALIASES[raw] !== undefined
+      ? raw
+      : NAME_ALIASES[raw.toLowerCase()] !== undefined
+        ? raw.toLowerCase()
+        : undefined
+    const contained = exactKey === undefined ? this.byContainment(raw) : undefined
     const broker = /^(US|HK|SH|SZ)\.([A-Za-z0-9.]+)$/.exec(raw)
-    let symbol = aliased
+    let symbol = exactKey !== undefined ? NAME_ALIASES[exactKey] : contained?.symbol
     if (symbol === undefined && broker !== null) {
       const market = broker[1] as string
       const code = (broker[2] as string).replace(/^0+(?=\d)/, '')
@@ -277,14 +325,25 @@ class PublicProvider implements MarketDataProvider {
             : `${code.padStart(6, '0')}.SZ`
     }
     if (symbol === undefined) return undefined
-    // The reader's own word stays the name: the catalogue's display name
-    // ("Bitcoin / US Dollar") describes the instrument but is not what they
-    // typed, and callers match a lookup back against what was asked.
+    // Keep Latin/English queries matching what the reader typed, while using canonical
+    // display names for Chinese aliases and containment matches so multi-source
+    // ranking does not echo an unrelated partial query like "腾讯济安".
+    const matchedKey = exactKey ?? contained?.key
+    let name = raw
+    if (matchedKey !== undefined) {
+      if (CANONICAL_ALIAS_NAMES[matchedKey] !== undefined) {
+        name = CANONICAL_ALIAS_NAMES[matchedKey]
+      } else if (/[\u4e00-\u9fff]/.test(matchedKey)) {
+        name = matchedKey
+      } else if (contained !== undefined) {
+        name = contained.key
+      }
+    }
     const catalogued = CATALOGUE.find(item => item.symbol.toUpperCase() === symbol!.toUpperCase())
     return {
       symbol,
-      name: raw,
-      assetClass: catalogued?.assetClass ?? 'equity',
+      name,
+      assetClass: catalogued?.assetClass ?? inferAssetClass(symbol),
       timeframes: TIMEFRAMES,
     }
   }
@@ -324,9 +383,9 @@ class PublicProvider implements MarketDataProvider {
    * @param raw - the reader's text, already trimmed.
    * @returns the instrument the text names, when it names one.
    */
-  private byContainment(raw: string): string | undefined {
+  private byContainment(raw: string): { key: string; symbol: string } | undefined {
     const text = raw.toLowerCase()
-    let best: { name: string; symbol: string } | undefined
+    let best: { key: string; symbol: string } | undefined
     for (const [name, symbol] of Object.entries(NAME_ALIASES)) {
       const key = name.toLowerCase()
       if (!text.includes(key)) continue
@@ -336,9 +395,9 @@ class PublicProvider implements MarketDataProvider {
         const after = text[at + key.length] ?? ''
         if (/[a-z0-9]/.test(before) || /[a-z0-9]/.test(after)) continue
       }
-      if (best === undefined || name.length > best.name.length) best = { name, symbol }
+      if (best === undefined || name.length > best.key.length) best = { key: name, symbol }
     }
-    return best?.symbol
+    return best
   }
 
   async search(query: string): Promise<InstrumentInfo[]> {

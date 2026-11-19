@@ -77,4 +77,35 @@ describe('backtest-engine', () => {
     expect(result.finalEquity).toBe(10000)
     expect(result.totalReturnPct).toBe(0)
   })
+
+  it('produces strictly JSON-lossless trade records with a defined reason on end-of-window forced close', () => {
+    const bars = generateCandles(20, 100, 1)
+    const enterOnce = (ctx: { index: number; position: unknown }) =>
+      ctx.index === 1 && !ctx.position
+        ? { action: 'enter_long' as const, reason: 'Open at bar 1' }
+        : { action: 'hold' as const }
+
+    const result = runBacktest('ETHUSDT', '1h', bars, enterOnce)
+
+    expect(result.totalTrades).toBe(1)
+    expect(result.trades[0]?.reason).toBe('End of window close')
+    for (const trade of result.trades) {
+      expect(Object.values(trade)).not.toContain(undefined)
+    }
+  })
+
+  it('omits reason property instead of storing undefined when a custom exit omits reason', () => {
+    const bars = generateCandles(10, 100, 0.5)
+    const custom = (ctx: { index: number }) => {
+      if (ctx.index === 1) return { action: 'enter_long' as const }
+      if (ctx.index === 3) return { action: 'exit_long' as const }
+      return { action: 'hold' as const }
+    }
+
+    const result = runBacktest('ETHUSDT', '1h', bars, custom)
+
+    expect(result.totalTrades).toBe(1)
+    expect('reason' in result.trades[0]!).toBe(false)
+    expect(Object.values(result.trades[0]!)).not.toContain(undefined)
+  })
 })

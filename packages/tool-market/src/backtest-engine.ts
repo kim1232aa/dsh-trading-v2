@@ -155,6 +155,7 @@ export function runBacktest(
 
         equity += netPnl
 
+        const reason = signal.reason ?? (!isExit ? 'End of window close' : undefined)
         trades.push({
           entryTime: currentPosition.entryTime,
           exitTime: candle.time,
@@ -164,7 +165,7 @@ export function runBacktest(
           pnl: Math.round(netPnl * 100) / 100,
           returnPct: Math.round(tradeReturnPct * 100) / 100,
           holdingBars: i - currentPosition.entryIndex,
-          reason: signal.reason,
+          ...(reason !== undefined ? { reason } : {}),
         })
 
         currentPosition = null
