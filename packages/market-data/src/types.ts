@@ -89,6 +89,14 @@ export interface MarketDataProvider {
   getOrderbook?(symbol: string): Promise<Orderbook>
   /** Fundamental financial metrics and valuations (基础财务估值). Optional. */
   getFundamentals?(symbol: string): Promise<FundamentalsPackage>
+  /**
+   * Resolve a name, a word, or a half-remembered ticker to instruments.
+   *
+   * Optional on purpose: a CSV tree or a broker feed may have no search of its
+   * own, and callers then fall back to asking for the exact symbol instead of
+   * pretending a lookup happened.
+   */
+  search?(query: string): Promise<InstrumentInfo[]>
 }
 
 /** Single price-quantity level in an orderbook. */

@@ -21,6 +21,15 @@ import type {
 export type * from './types.js'
 export { formatUsdtCn, formatPctCn } from './format.js'
 
+/** One instrument hit paired with the provider that owns it. */
+export interface SearchHit {
+  providerId: string
+  item: InstrumentInfo
+}
+
+/** Deterministic search precedence across mounted feeds. */
+const SEARCH_PRIORITY: readonly string[] = ['binance', 'cn', 'public']
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     marketData: MarketData
@@ -148,6 +157,68 @@ export class MarketData extends Service {
   listSymbols(providerId?: string): Promise<InstrumentInfo[]> {
     return this.provider(providerId).listSymbols()
   }
+
+  private orderedSearchProviders(): MarketDataProvider[] {
+    const out: MarketDataProvider[] = []
+    const seen = new Set<string>()
+    for (const id of SEARCH_PRIORITY) {
+      const p = this.providers.get(id)
+      if (p !== undefined) {
+        out.push(p)
+        seen.add(id)
+      }
+    }
+    for (const [id, p] of this.providers) {
+      if (!seen.has(id)) out.push(p)
+    }
+    return out
+  }
+
+  /**
+   * Search instruments and keep each hit's owning providerId.
+   * When providerId is named, query that provider strictly; otherwise query all
+   * mounted searchable providers in deterministic order (binance -> cn -> public -> others),
+   * isolating single-provider failures.
+   */
+  searchWithProvider(query: string, providerId?: string): Promise<SearchHit[]> {
+    if (providerId !== undefined) {
+      const provider = this.provider(providerId)
+      if (provider.search === undefined) return Promise.resolve([])
+      return provider.search(query).then(items => deduplicateHits([{ providerId: provider.id, items }]))
+    }
+    const searchable = this.orderedSearchProviders().filter(p => typeof p.search === 'function')
+    if (searchable.length === 0) return Promise.resolve([])
+    return Promise.allSettled(searchable.map(p => p.search!(query))).then(results => {
+      const groups: Array<{ providerId: string; items: InstrumentInfo[] }> = []
+      for (let i = 0; i < searchable.length; i += 1) {
+        const res = results[i]!
+        if (res.status === 'fulfilled') groups.push({ providerId: searchable[i]!.id, items: res.value })
+      }
+      return deduplicateHits(groups)
+    })
+  }
+
+  /**
+   * Convenience: resolve free text to instruments through one explicit provider
+   * or across mounted providers in priority order.
+   */
+  search(query: string, providerId?: string): Promise<InstrumentInfo[]> {
+    return this.searchWithProvider(query, providerId).then(hits => hits.map(h => h.item))
+  }
+}
+
+function deduplicateHits(groups: readonly { providerId: string; items: readonly InstrumentInfo[] }[]): SearchHit[] {
+  const out: SearchHit[] = []
+  const seen = new Set<string>()
+  for (const { providerId, items } of groups) {
+    for (const item of items) {
+      const key = `${providerId}\0${item.symbol.trim().toUpperCase()}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({ providerId, item })
+    }
+  }
+  return out
 }
 
 export namespace MarketData {
