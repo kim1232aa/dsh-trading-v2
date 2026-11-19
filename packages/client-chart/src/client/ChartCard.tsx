@@ -154,6 +154,8 @@ export type AnnotationRendererContext = {
   timeframe: string
   close: number
   palette: Palette
+  color?: string
+  roleOrdinal?: number
 }
 
 /**
@@ -190,6 +192,49 @@ function roleColor(role: unknown, p: Palette): string {
   }
 }
 
+const ZONE_ROLE_COLORS_DARK: Record<string, readonly string[]> = {
+  support: ['#3ddc97', '#06b6d4', '#84cc16', '#14b8a6', '#38bdf8', '#22c55e'],
+  resistance: ['#f47067', '#ff9800', '#ec4899', '#f43f5e', '#fb7185', '#ef4444'],
+  neckline: ['#d4a72c', '#facc15', '#f59e0b'],
+  target: ['#539bf5', '#818cf8', '#60a5fa'],
+  invalidation: ['#b083f0', '#c084fc', '#a78bfa'],
+  other: ['#768390', '#94a3b8', '#64748b', '#a1a1aa'],
+}
+
+const ZONE_ROLE_COLORS_LIGHT: Record<string, readonly string[]> = {
+  support: ['#26a17b', '#0891b2', '#65a30d', '#0d9488', '#0284c7', '#16a34a'],
+  resistance: ['#e0563f', '#ea580c', '#db2777', '#e11d48', '#f43f5e', '#dc2626'],
+  neckline: ['#b08800', '#ca8a04', '#d97706'],
+  target: ['#3b7dd8', '#4f46e5', '#2563eb'],
+  invalidation: ['#a475e0', '#9333ea', '#7c3aed'],
+  other: ['#8b949e', '#64748b', '#475569', '#71717a'],
+}
+
+export function resolveAnnotationColor(a: Record<string, unknown>, p: Palette, roleOrdinal = 0): string {
+  const explicit = a['color']
+  if (typeof explicit === 'string' && /^#[0-9a-fA-F]{6}$/.test(explicit)) return explicit
+  if (a['type'] !== 'zone') return roleColor(a['role'], p)
+  const isLight = p.up === LIGHT.up
+  const table = isLight ? ZONE_ROLE_COLORS_LIGHT : ZONE_ROLE_COLORS_DARK
+  const roleKey = typeof a['role'] === 'string' && a['role'] in table ? a['role'] : 'other'
+  const list = table[roleKey]!
+  const idx = Number.isInteger(roleOrdinal) && roleOrdinal >= 0 ? roleOrdinal : 0
+  if (idx === 0) return roleColor(a['role'], p)
+  return list[idx % list.length]!
+}
+
+export function assignAnnotationColors(annotations: readonly Record<string, unknown>[], p: Palette): string[] {
+  const counts = new Map<string, number>()
+  return annotations.map((a) => {
+    const type = typeof a['type'] === 'string' ? a['type'] : ''
+    const role = typeof a['role'] === 'string' ? a['role'] : 'other'
+    const key = `${type}:${role}`
+    const ord = counts.get(key) ?? 0
+    counts.set(key, ord + 1)
+    return resolveAnnotationColor(a, p, ord)
+  })
+}
+
 function num(x: unknown): number | undefined {
   return typeof x === 'number' && Number.isFinite(x) ? x : undefined
 }
@@ -202,13 +247,15 @@ function str(x: unknown): string | undefined {
 registerAnnotationRenderer('level', (a, ctx) => {
   const price = num(a['price'])
   if (price === undefined) return []
-  return [{ kind: 'hline', price, dashed: true, color: roleColor(a['role'], ctx.palette), ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {} }]
+  const color = ctx.color ?? resolveAnnotationColor({ ...a, type: 'level' }, ctx.palette, ctx.roleOrdinal ?? 0)
+  return [{ kind: 'hline', price, dashed: true, color, ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {} }]
 })
 registerAnnotationRenderer('zone', (a, ctx) => {
   const low = num(a['low'])
   const high = num(a['high'])
   if (low === undefined || high === undefined) return []
-  return [{ kind: 'region', low, high, color: roleColor(a['role'], ctx.palette),
+  const color = ctx.color ?? resolveAnnotationColor({ ...a, type: 'zone' }, ctx.palette, ctx.roleOrdinal ?? 0)
+  return [{ kind: 'region', low, high, color,
     ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {},
     ...str(a['startTime']) !== undefined ? { startTime: str(a['startTime'])! } : {},
     ...str(a['availableAt']) !== undefined ? { availableAt: str(a['availableAt'])! } : {},
@@ -227,7 +274,8 @@ registerAnnotationRenderer('path', (a, ctx) => {
     return [{ time, price }]
   })
   if (points.length < 2) return []
-  return [{ kind: 'polyline', points, dashed: true, color: roleColor(a['role'], ctx.palette),
+  const color = ctx.color ?? resolveAnnotationColor({ ...a, type: 'path' }, ctx.palette, ctx.roleOrdinal ?? 0)
+  return [{ kind: 'polyline', points, dashed: true, color,
     ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {},
     ...notes.some(n => n !== '') ? { notes } : {} }]
 })
@@ -1589,12 +1637,15 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
     const ctx: AnnotationRendererContext = { contractVersion: 1, timeframe: data.timeframe, close, palette }
     // Collect every primitive before drawing any: label placement is the one
     // decision that cannot be made one line at a time.
+    const annotations = data.annotations ?? []
+    const annotationColors = assignAnnotationColors(annotations, palette)
     const primitives: DrawPrimitive[] = []
-    for (const annotation of data.annotations ?? []) {
+    for (let idx = 0; idx < annotations.length; idx++) {
+      const annotation = annotations[idx]!
       const renderer = annotationRenderers.get(annotation.type)
       if (renderer === undefined) continue
       try {
-        primitives.push(...renderer(annotation, ctx))
+        primitives.push(...renderer(annotation, { ...ctx, color: annotationColors[idx]! }))
       } catch (error) {
         console.warn(`[client-chart] renderer for '${annotation.type}' failed`, error)
       }
@@ -2195,10 +2246,10 @@ function Fallback({ text, error, onReset }: { text: string; error: boolean; onRe
   )
 }
 
-function annotationRow(a: ChartAnnotation, close: number, p: Palette): { key: string; color: string; label: string; where: string; distance: string; sources: string } | null {
+function annotationRow(a: ChartAnnotation, close: number, p: Palette, resolvedColor?: string): { key: string; color: string; label: string; where: string; distance: string; sources: string } | null {
   const sources = Array.isArray(a['sources']) ? a['sources'].filter((s): s is string => typeof s === 'string').join(' + ') : ''
   const label = str(a['label']) ?? a.type
-  const color = roleColor(a['role'], p)
+  const color = resolvedColor ?? resolveAnnotationColor(a, p)
   const pct = (x: number): string => close === 0 ? '' : `${x >= close ? '+' : ''}${(((x - close) / close) * 100).toFixed(2)}%`
   if (a.type === 'level') {
     const price = num(a['price'])
@@ -2936,8 +2987,10 @@ export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, 
     return [{ id: def.id, text: `${text} · ${zhState(state)}`, togglable, on: def.id === 'rsi' ? (settings['RSI_GRID']?.visible ?? false) : def.id === 'vol' ? (settings['VOL_TIER']?.visible ?? false) : activeChips.includes(def.id) }]
   })
 
-  const rows = (tf.annotations ?? [])
-    .map(a => annotationRow(a, last.close, palette))
+  const annotationsList = tf.annotations ?? []
+  const rowColors = assignAnnotationColors(annotationsList, palette)
+  const rows = annotationsList
+    .map((a, i) => annotationRow(a, last.close, palette, rowColors[i]))
     .filter((r): r is NonNullable<typeof r> => r !== null)
 
   // What counts as "a different chart" for rebuild purposes: the instrument,

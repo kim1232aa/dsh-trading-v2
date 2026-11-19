@@ -172,7 +172,7 @@ export function createAnnotationOverlays(family: string, measureText: MeasureTex
         (confirmationX === undefined || !Number.isFinite(confirmationX) || confirmationX > bounding.width)) return []
       const figures: OverlayFigure[] = [{
         type: 'rect', attrs: { x: left, y: top, width: bounding.width - left, height: bottom - top },
-        styles: { style: 'fill', color: `${color}26` }, ignoreEvent: true,
+        styles: { style: 'stroke_fill', color: `${color}28`, borderColor: `${color}99`, borderSize: 1, borderStyle: 'dashed' }, ignoreEvent: true,
       }]
       if (ext['knownAfterConfirmation'] === true && confirmationX !== undefined && confirmationX >= left) {
         figures.push({ type: 'line', attrs: { coordinates: [{ x: confirmationX, y: top }, { x: confirmationX, y: bottom }] },
