@@ -11,7 +11,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { Candle, Timeframe } from '@dsh-trading/market-data'
+import type { Candle, MarketDataProvider, Timeframe } from '@dsh-trading/market-data'
 import { ema, macd } from './candle-indicators.js'
 import { rsi, sma } from './indicators.js'
 import { regimeSnapshot, renderSnapshot } from './regime.js'
@@ -19,6 +19,8 @@ import { chartHtml, renderChartSvg } from './chart.js'
 import type { ChartLevel, ChartOverlay } from './chart.js'
 import { chartCandles, chartSeries, regimeSeries, roundSeries } from './chart-payload.js'
 import type { AnnotationRole, ChartAnnotation, ChartPayload, ChartScenario, ChartTimeframeData } from './chart-payload.js'
+import { resolveWalkthrough, WALK_FIELDS, WALK_MARK_TYPES, WALK_PANES } from './walkthrough.js'
+import type { WalkthroughArgs, WalkthroughPayload } from './walkthrough.js'
 import {
   createDonchianStrategy,
   createDualEmaStrategy,
@@ -65,6 +67,10 @@ export type {
   AnnotationRole, ChartAnnotation, ChartCandle, ChartLevelAnnotation, ChartPayload,
   ChartScenario, ChartSeries, ChartTimeframeData, ChartZoneAnnotation,
 } from './chart-payload.js'
+export { resolveWalkthrough, PANE_COLUMNS, WALK_FIELDS, WALK_MARK_TYPES, WALK_PANES } from './walkthrough.js'
+export type {
+  WalkField, WalkLine, WalkMark, WalkPane, WalkPoint, WalkSurface, WalkthroughArgs, WalkthroughPayload,
+} from './walkthrough.js'
 export {
   createDonchianStrategy,
   createDualEmaStrategy,
@@ -167,6 +173,82 @@ export function apply(ctx: Context, config: Config): void {
       }
     },
     presentCall: args => ({ card: 'generic', title: 'List symbols', kind: 'read', rawInput: args }),
+  }))
+  ctx.tools.register(defineTool({
+    name: 'resolve_symbol',
+    description: 'Resolve an instrument name, a Chinese company name or a broker-style code (US.MU, HK.00700) to the exact symbol and provider this market feed can chart. Call this when the reader names an instrument in words instead of the provider symbol — never guess a ticker and then report data for the wrong company.',
+    parameters: {
+      query: { type: 'string', required: true, description: 'What the reader called it: "腾讯", "台积电", "tesla", "US.MU", "700 HK", "茅台", "以太坊".' },
+      provider: { type: 'string', description: 'Provider id to search. Omit to route across binance, cn, and public.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          provider: { type: 'string', required: true },
+          query: { type: 'string', required: true },
+          matches: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                symbol: { type: 'string', required: true },
+                provider: { type: 'string' },
+                name: { type: 'string' },
+                assetClass: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.matches.length === 0
+          ? `No instrument matched '${value.query}'. Ask the reader for the exact ticker, or list_symbols for the catalogue.`
+          : value.matches
+            .map(m => `${m.symbol}${m.provider !== undefined ? ` [${m.provider}]` : ''}${m.name !== undefined ? ` — ${m.name}` : ''}${m.assetClass !== undefined ? ` (${m.assetClass})` : ''}`)
+            .join('\n'),
+      }],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, _exec) {
+      const hub = ctx.marketData as {
+        provider: (id?: string) => MarketDataProvider
+        searchWithProvider?: (query: string, providerId?: string) => Promise<Array<{ providerId: string; item: { symbol: string; name?: string; assetClass?: string } }>>
+      }
+      if (args.provider === undefined && typeof hub.searchWithProvider === 'function') {
+        const hits = await hub.searchWithProvider(args.query)
+        const primaryProvider = hits[0]?.providerId ?? (() => {
+          try { return hub.provider().id } catch { return 'auto' }
+        })()
+        return {
+          provider: primaryProvider,
+          query: args.query,
+          matches: hits.slice(0, 8).map(h => ({
+            symbol: h.item.symbol,
+            provider: h.providerId,
+            ...h.item.name !== undefined ? { name: h.item.name } : {},
+            ...h.item.assetClass !== undefined ? { assetClass: h.item.assetClass } : {},
+          })),
+        }
+      }
+      const provider = hub.provider(args.provider)
+      const matches = provider.search === undefined ? [] : await provider.search(args.query)
+      return {
+        provider: provider.id,
+        query: args.query,
+        matches: matches.slice(0, 8).map(m => ({
+          symbol: m.symbol,
+          provider: provider.id,
+          ...m.name !== undefined ? { name: m.name } : {},
+          ...m.assetClass !== undefined ? { assetClass: m.assetClass } : {},
+        })),
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: `Resolve ${args.query}`, kind: 'read', rawInput: args }),
   }))
 
   ctx.tools.register(defineTool({
@@ -987,6 +1069,115 @@ export function apply(ctx: Context, config: Config): void {
     presentCall: args => ({
       card: 'generic',
       title: `Swing Points: ${args.symbol} @ ${args.timeframe}`,
+      kind: 'other',
+      rawInput: args,
+    }),
+  }))
+  const walkPoint = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      time: { type: 'string', description: 'Bar: a date (YYYY-MM-DD) on daily/weekly charts, the bar-open ISO time on intraday ones.' },
+      field: { type: 'string', enum: [...WALK_FIELDS], description: 'What on that bar: high, low, close, volume, or an indicator value.' },
+      value: { type: 'number', description: 'The value you are about to say, if any. Checked against the bar.' },
+      ahead: { type: 'integer', description: 'Paths only: a projection this many bars past the last one (with price).' },
+      price: { type: 'number', description: 'Paths only: the projected price for an ahead point.' },
+    },
+  } as const
+
+  ctx.tools.register(defineTool({
+    name: 'walkthrough',
+    description: 'Tell one section of your analysis to the reader on their own chart, the way an analyst sitting beside them would: a few short spoken lines (one or two sentences each), each moving the chart. Circle a bar, draw a level, light up a zone, point at something. Call it once per section, conclusion first; a later section can re-light an earlier mark with focus. Marks are anchored to bars ({ time, field }) and the tool reads the value off the bar, so take the numbers you say from it. A level needs a checkable source or at least a why. End a section with ask (1-3 short replies the reader can tap) to stop and let them answer; then end your turn. Research only: no entries, sizes or recommendations.',
+    parameters: {
+      symbol: { type: 'string', required: true, description: 'Instrument symbol exactly as list_symbols or resolve_symbol reports it.' },
+      timeframe: { type: 'string', required: true, enum: [...TIMEFRAMES], description: 'The chart this section is told on.' },
+      section: { type: 'string', required: true, description: 'Short section title, e.g. "结论", "大背景", "双顶", "接下来".' },
+      from: { type: 'string', description: 'First bar the chart frames (date or ISO time). Default: the last 60 bars.' },
+      pane: { type: 'string', enum: [...WALK_PANES], description: 'Indicator pane to open under the chart for this section.' },
+      marks: {
+        type: 'array',
+        description: 'What this section draws. Each mark is drawn by the line that talks about it.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true, description: 'Short id, unique in this section; lines and later sections refer to it.' },
+            type: { type: 'string', required: true, enum: [...WALK_MARK_TYPES], description: 'circle a bar value; level; zone; path or arrow through bars; span of time.' },
+            at: { ...walkPoint, description: 'circle: the bar and field to circle.' },
+            price: { type: 'number', description: 'level: the price.' },
+            low: { type: 'number', description: 'zone: lower edge.' },
+            high: { type: 'number', description: 'zone: upper edge.' },
+            points: { type: 'array', items: walkPoint, description: 'path/arrow: bar points, then optional ahead projections.' },
+            from: { type: 'string', description: 'span: first bar.' },
+            to: { type: 'string', description: 'span: last bar (default: the latest).' },
+            source: {
+              type: 'object',
+              additionalProperties: false,
+              description: 'level: where the price comes from, checked against the bars.',
+              properties: {
+                field: { type: 'string', required: true, enum: [...WALK_FIELDS] },
+                time: { type: 'string', description: 'The bar the value is read on (default: the latest).' },
+                stat: { type: 'string', enum: ['min', 'max'], description: 'Lowest/highest field over from...to.' },
+                from: { type: 'string' },
+                to: { type: 'string' },
+              },
+            },
+            why: { type: 'string', description: 'Plain reason, when no checkable source fits (zones always need one).' },
+            label: { type: 'string', description: 'Short caption on the chart.' },
+            tone: { type: 'string', enum: ['up', 'down', 'neutral'], description: 'up/down for bull/bear signals; neutral otherwise.' },
+            role: { type: 'string', description: 'Accepted for annotate_chart habits: support reads as tone up, resistance as down. Prefer tone.' },
+            pane: { type: 'string', enum: ['price', 'volume', 'indicator'], description: 'level: which pane (default price).' },
+            keep: { type: 'boolean', description: 'Leave it faintly on the chart for later sections (the key zone of a conclusion).' },
+          },
+        },
+      },
+      lines: {
+        type: 'array',
+        required: true,
+        description: 'What you say, in order. Spoken, first person, one or two sentences each.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            say: { type: 'string', required: true, description: 'The line. Wrap the words a mark explains as [[markId|words]].' },
+            draw: { type: 'array', items: { type: 'string' }, description: 'Ids of this section marks to draw as you say it.' },
+            point: { type: 'string', description: 'Mark id to point at (this or an earlier section).' },
+            pointAt: { ...walkPoint, description: 'Or point at a bar value without drawing.' },
+            focus: { type: 'string', description: 'Re-light a mark from an earlier section, e.g. the conclusion zone.' },
+            volume: { type: 'array', items: { type: 'string' }, description: 'Bars whose volume to spotlight (the rest dim).' },
+          },
+        },
+      },
+      ask: { type: 'array', items: { type: 'string' }, description: '1-3 short replies the reader can tap after the last line. Then end your turn.' },
+      provider: { type: 'string', description: 'Provider id. Omit to use the default or symbol-matched provider.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          summary: { type: 'string', required: true },
+          walkthrough: { type: 'json', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.summary }],
+      presentationMeta: (_args, value) => value.walkthrough as WalkthroughPayload,
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, _exec) {
+      const hub = ctx.marketData as {
+        resolveProvider?: (symbol: string, explicitId?: string) => MarketDataProvider
+        provider: (id?: string) => MarketDataProvider
+      }
+      const provider = typeof hub.resolveProvider === 'function' ? hub.resolveProvider(args.symbol, args.provider) : hub.provider(args.provider)
+      const candles = await provider.getOhlcv({ symbol: args.symbol, timeframe: args.timeframe as Timeframe, limit: 400 })
+      if (candles.length === 0) throw new Error(`no candles for ${args.symbol} @ ${args.timeframe}`)
+      const { payload, summary } = resolveWalkthrough(args as unknown as WalkthroughArgs, candles, provider.id)
+      return { summary, walkthrough: payload }
+    },
+    presentCall: args => ({
+      card: 'generic',
+      title: `Walkthrough: ${args.section}`,
       kind: 'other',
       rawInput: args,
     }),
