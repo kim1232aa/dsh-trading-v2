@@ -76,6 +76,27 @@ describe('enrichChartTimeframe (live panel chips)', () => {
     }
   })
 
+  it("lets a walkthrough section's own columns win over the locally computed ones", () => {
+    // A section carries only its pane's columns, null outside the window it read.
+    // Recomputing them from the whole chart would show numbers the model never
+    // read (different warm-up) and numbers outside the window it spoke about.
+    const raw = candlesToPayload('binance', 'ETHUSDT', '5m', synthCandles(80)).timeframes[0]!
+    const hist = raw.candles.map((_, i) => (i === 70 ? 12.5 : null))
+    const tf = enrichChartTimeframe({ ...raw, series: { macd_hist: hist } })
+    expect(tf.series?.['macd_hist']).toBe(hist)
+    expect(tf.series?.['macd_hist']?.[69]).toBeNull()
+    // The columns the section did not carry are still filled in, so other chips keep working.
+    expect(tf.series?.['rsi14']).toHaveLength(80)
+    expect(tf.series?.['stoch_k']).toHaveLength(80)
+  })
+
+  it('still ignores a column whose length no longer matches the candles', () => {
+    const raw = candlesToPayload('binance', 'ETHUSDT', '5m', synthCandles(80)).timeframes[0]!
+    const tf = enrichChartTimeframe({ ...raw, series: { macd_hist: [1, 2, 3] } })
+    expect(tf.series?.['macd_hist']).toHaveLength(80)
+    expect(tf.series?.['macd_hist']).not.toEqual([1, 2, 3])
+  })
+
   it('keeps agent-provided series when already aligned', () => {
     const candles = synthCandles(10)
     const series = { rsi14: candles.map((_, i) => i) }

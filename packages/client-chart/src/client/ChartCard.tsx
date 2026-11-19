@@ -34,7 +34,8 @@ import { ChartTools } from './ChartTools.js'
 import { ChartChrome, applyDisplayToChart, getDisplaySettings } from './ChartChrome.js'
 import type { ChromeChip, ChromeIndicator } from './ChartChrome.js'
 import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
-import { publishLatestChart } from './latest.js'
+import { getColumnOpen, publishLatestChart, subscribeColumn } from './latest.js'
+import type { PaneIds } from './LessonLayer.js'
 import { annotationDigest, contentText, readCallFallbackPayload, readChartPayload } from './payload.js'
 import type { ChartAnnotation, ChartPayload, ChartScenario, ChartTimeframeData } from './payload.js'
 import type { PanelDerivativeBar, PanelDerivatives, PanelLargeOrders, PanelLargeTrade } from './market-client.js'
@@ -1038,7 +1039,7 @@ registerIndicator(aicoinTdMarksIndicator as never)
   registerProOverlays()
 }
 
-function useDark(): boolean {
+export function useDark(): boolean {
   const [dark, setDark] = useState(() =>
     typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches)
   useEffect(() => {
@@ -1118,6 +1119,28 @@ export function klineStyles(p: Palette, _coordType: CoordType = 'normal'): Recor
 const snapshotCache = new WeakMap<ChartTimeframeData['candles'], NonNullable<ChartTimeframeData['indicators']>>()
 const regimeSeriesCache = new WeakMap<ChartTimeframeData['candles'], NonNullable<ChartTimeframeData['series']>>()
 const chipRowsCache = new WeakMap<NonNullable<ChartTimeframeData['series']>, Map<string, Record<string, number | undefined>[]>>()
+const mergedSeriesCache = new WeakMap<NonNullable<ChartTimeframeData['series']>, { candles: ChartTimeframeData['candles']; series: NonNullable<ChartTimeframeData['series']> }>()
+
+/**
+ * Columns the payload already carries win over the locally computed ones: a
+ * walkthrough section ships only its own pane's columns, null outside the
+ * window it read, and recomputing them over the whole chart would show numbers
+ * the model never read. Columns whose length no longer matches the candles are
+ * stale and ignored. The result is cached per series identity.
+ */
+function withOwnColumns(tf: ChartTimeframeData, local: NonNullable<ChartTimeframeData['series']>): NonNullable<ChartTimeframeData['series']> {
+  const own = tf.series
+  if (own === undefined) return local
+  const cached = mergedSeriesCache.get(own)
+  if (cached !== undefined && cached.candles === tf.candles) return cached.series
+  const aligned: NonNullable<ChartTimeframeData['series']> = {}
+  for (const [key, col] of Object.entries(own)) {
+    if (Array.isArray(col) && col.length === tf.candles.length) aligned[key] = col
+  }
+  const series = Object.keys(aligned).length === 0 ? local : { ...local, ...aligned }
+  mergedSeriesCache.set(own, { candles: tf.candles, series })
+  return series
+}
 
 export function enrichChartTimeframe(tf: ChartTimeframeData): ChartTimeframeData {
   if (tf.candles.length === 0) return tf
@@ -1130,12 +1153,12 @@ export function enrichChartTimeframe(tf: ChartTimeframeData): ChartTimeframeData
       indicators = regimeSnapshot(tf.candles)
       snapshotCache.set(tf.candles, indicators)
     }
-    let series = seriesOk ? tf.series : regimeSeriesCache.get(tf.candles)
-    if (series === undefined) {
-      series = regimeSeries(tf.candles)
-      regimeSeriesCache.set(tf.candles, series)
+    let local = seriesOk ? undefined : regimeSeriesCache.get(tf.candles)
+    if (!seriesOk && local === undefined) {
+      local = regimeSeries(tf.candles)
+      regimeSeriesCache.set(tf.candles, local)
     }
-    return { ...tf, indicators, series }
+    return { ...tf, indicators, series: seriesOk ? tf.series! : withOwnColumns(tf, local!) }
   } catch {
     return tf
   }
@@ -1231,6 +1254,56 @@ const CHIP_DEFS: ChipDef[] = [
   { id: 'bb', indicator: { name: 'TM_BB', figures: { upper: 'bb_upper', middle: 'bb_middle', lower: 'bb_lower' }, overlay: true }, label: ind => ({ text: '布林(20,2)', state: get(ind['bollinger20'], 'state') }) },
   { id: 'ma', label: ind => ({ text: '均线位置', state: get(ind['movingAverages'], 'closeVs') }) },
 ]
+
+/**
+ * The indicator a chip mounts. A walkthrough forces its own panes, and its 'rsi'
+ * means ONE line (rsi14) in its own pane — not the RSI_GRID pair that the
+ * reader's RSI chip stands for.
+ */
+export function chipIndicator(id: string, forced: boolean): ChipDef['indicator'] {
+  if (forced && id === 'rsi') return { name: 'TM_RSI', figures: { rsi: 'rsi14' } }
+  return CHIP_DEFS.find(d => d.id === id)?.indicator
+}
+
+/** Pane ids the ink layer aims at: volume plus each mounted chip pane, never the price pane. */
+export function lessonPaneIds(mounted: ReadonlyMap<string, string>, volumePane: string | undefined): PaneIds {
+  const out: PaneIds = {}
+  if (volumePane !== undefined) out.volume = volumePane
+  for (const [id, paneId] of mounted) {
+    if (paneId !== 'candle_pane') out[id] = paneId
+  }
+  return out
+}
+
+export function samePaneIds(a: PaneIds, b: PaneIds): boolean {
+  const ak = Object.keys(a)
+  if (ak.length !== Object.keys(b).length) return false
+  return ak.every(k => a[k] === b[k])
+}
+
+/** With the persistent column open a tool card collapses to a receipt the reader can expand. */
+export function cardView(columnOpen: boolean, expanded: boolean): 'chart' | 'receipt' {
+  return columnOpen && !expanded ? 'receipt' : 'chart'
+}
+
+export function chartReceipt(toolName: string, payload: ChartPayload): string {
+  const bars = payload.timeframes[0]?.candles.length ?? 0
+  const marks = payload.timeframes.reduce((n, t) => n + (t.annotations?.length ?? 0), 0)
+  const tfs = payload.timeframes.map(t => t.timeframe).join(' · ')
+  return [toolName, `${payload.symbol}${tfs === '' ? '' : ` ${tfs}`}`, `${bars} 根K线`, ...(marks > 0 ? [`${marks} 条标注`] : [])].join(' · ')
+}
+
+/** What the ink layer needs from a live canvas. */
+export interface KlineReady { chart: Chart; panes: PaneIds }
+
+const RECEIPT: CSSProperties = {
+  display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', fontSize: 12.5, lineHeight: '20px',
+  color: 'var(--dsw-alias-text-3, #8b949e)', margin: '2px 0',
+}
+const RECEIPT_BUTTON: CSSProperties = {
+  border: 0, background: 'none', padding: 0, font: 'inherit', color: 'inherit', cursor: 'pointer',
+  textDecoration: 'underline', textUnderlineOffset: 3,
+}
 
 /** Lanes available before a label is dropped rather than stacked. */
 const LABEL_LANES = 4
@@ -1375,8 +1448,12 @@ export function planChipSync(active: readonly string[], mounted: ReadonlyMap<str
   return { add: [...want].filter(id => !have.has(id)), remove: [...have].filter(id => !want.has(id)) }
 }
 
-function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, axisSettings, onEditParams, derivatives, cvd, largeWalls, wallMarket = 'all', onCrosshairHover, history, baseHeight = CHART_HEIGHT, fill = false, onChartReady, drawBarOpen = true }: {
+function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, axisSettings, onEditParams, derivatives, cvd, largeWalls, wallMarket = 'all', onCrosshairHover, history, baseHeight = CHART_HEIGHT, fill = false, onChartReady, drawBarOpen = true, forced = false, overlay }: {
   data: ChartTimeframeData
+  /** True when a walkthrough names the panes (see {@link chipIndicator}). */
+  forced?: boolean
+  /** Ink drawn over the canvas, inside the same box as the chart (right of the drawing bar). */
+  overlay?: ((ready: KlineReady) => ReactNode) | undefined
   /** Older-bar paging for klinecharts loadMore; absent on agent cards. */
   history?: ChartHistory | undefined
   settings: IndicatorSettings
@@ -1421,6 +1498,7 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
   const chartDomId = useRef(`dsh-kline-${++chartDomSeq}`)
   const chartRef = useRef<Chart | null>(null)
   const [chartReady, setChartReady] = useState(0)
+  const [lessonPanes, setLessonPanes] = useState<PaneIds>({})
   /** Live-bar sink from DataLoader.subscribeBar (klinecharts 10). */
   const barSubscribeRef = useRef<BarSubscriber>(null)
   const ohlcParkCleanup = useRef<(() => void) | null>(null)
@@ -1877,23 +1955,26 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
     if (chart === null || last === undefined) return
     barSubscribeRef.current?.(toKLine(last))
     const plan = planChipSync(active, mountedChips.current, id => {
-      const def = CHIP_DEFS.find(d => d.id === id)
-      if (!def?.indicator) return false
-      if (def.indicator.builtIn === true) return def.indicator.name !== 'RSI_GRID' && def.indicator.name !== 'VOL_TIER'
-      return hasSeries(data, def.indicator.figures)
+      const ind = chipIndicator(id, forced)
+      if (!ind) return false
+      if (ind.builtIn === true) return ind.name !== 'RSI_GRID' && ind.name !== 'VOL_TIER'
+      return hasSeries(data, ind.figures)
     })
     for (const id of plan.remove) {
-      const def = CHIP_DEFS.find(d => d.id === id)
       const paneId = mountedChips.current.get(id)
       mountedChips.current.delete(id)
-      if (!def?.indicator || paneId === undefined) continue
-      try { removeInd(chart, paneId, def.indicator.name) } catch { /* already gone */ }
+      if (paneId === undefined) continue
+      // The pane may have been mounted under the other meaning of the chip (reader vs walkthrough).
+      const names = new Set([chipIndicator(id, false)?.name, chipIndicator(id, true)?.name])
+      for (const name of names) {
+        if (name === undefined) continue
+        try { removeInd(chart, paneId, name) } catch { /* already gone */ }
+      }
     }
     for (const id of plan.add) {
-      const def = CHIP_DEFS.find(d => d.id === id)!
-      const ind = def.indicator!
+      const ind = chipIndicator(id, forced)!
       if (ind.builtIn === true) {
-        const paneId = `pane_${def.id}`
+        const paneId = `pane_${id}`
         createIndicatorInPane(chart, ind.name, { paneId, height: PANE_HEIGHT })
         mountedChips.current.set(id, paneId)
         continue
@@ -1905,11 +1986,19 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
     }
     for (const [id, paneId] of mountedChips.current) {
       if (plan.add.includes(id)) continue
-      const def = CHIP_DEFS.find(d => d.id === id)
-      if (!def?.indicator || def.indicator.builtIn === true || !hasSeries(data, def.indicator.figures)) continue
-      overrideInd(chart, { name: def.indicator.name, extendData: seriesRows(data, def.indicator.figures) }, paneId)
+      const ind = chipIndicator(id, forced)
+      if (!ind || ind.builtIn === true || !hasSeries(data, ind.figures)) continue
+      overrideInd(chart, { name: ind.name, extendData: seriesRows(data, ind.figures) }, paneId)
     }
-  }, [data, active, seriesKey, dark])
+  }, [data, active, seriesKey, dark, forced])
+
+  // Tell the ink layer which pane ids exist. Runs after the chip sync above, so the map is current.
+  const volumeVisible = settings['VOL_TIER']?.visible === true
+  useEffect(() => {
+    if (chartRef.current === null) return
+    const next = lessonPaneIds(mountedChips.current, volumeVisible ? 'pane_vol' : undefined)
+    setLessonPanes(cur => (samePaneIds(cur, next) ? cur : next))
+  }, [data, active, seriesKey, dark, forced, volumeVisible, chartReady])
 
   // Indicator alertconditions (VB + NW + Dual View HTF + AiCoin K线形态): fire once per id; first eval seeds.
   const vbSeen = useRef<Set<string> | null>(null)
@@ -2123,6 +2212,13 @@ function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, a
           })}
         </div>
       )}
+      {overlay !== undefined && chartReady > 0 && chartRef.current !== null
+        ? (
+          <div data-lesson-box style={{ position: 'absolute', left: drawBarW, right: 0, top: 0, bottom: 0, pointerEvents: 'none', zIndex: 2 }}>
+            {overlay({ chart: chartRef.current, panes: lessonPanes })}
+          </div>
+        )
+        : null}
       {chartReady > 0 && drawBarOpen ? <ChartTools chart={chartRef.current} dark={dark} /> : null}
       {vbToasts.length > 0 && (
         <div role="status" aria-label="指标提醒" style={{ position: 'absolute', right: 70, top: 8, zIndex: 5, display: 'flex', flexDirection: 'column', gap: 4, pointerEvents: 'auto' }}>
@@ -2888,8 +2984,11 @@ function getInitialActiveChips(): string[] {
   return ['vol']
 }
 
-export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, fill = false, prose = true, derivatives, cvd, largeWalls, wallMarket = 'all', onCrosshairHover, history }: {
+export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, fill = false, prose = true, derivatives, cvd, largeWalls, wallMarket = 'all', onCrosshairHover, history, forceChips, overlay }: {
   payload: ChartPayload
+  /** A walkthrough section's panes: replace the reader's chips for as long as it speaks. */
+  forceChips?: string[] | undefined
+  overlay?: ((ready: KlineReady) => ReactNode) | undefined
   history?: ChartHistory | undefined
   chartHeight?: number
   shell?: CSSProperties
@@ -2931,7 +3030,7 @@ export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, 
     if (!rawTf) return undefined
     return enrichChartTimeframe(rawTf)
   }, [rawTf])
-  const activeKey = useMemo(() => [...activeChips].sort().join(','), [activeChips])
+  const activeKey = useMemo(() => [...(forceChips ?? activeChips)].sort().join(','), [forceChips, activeChips])
   const activeList = useMemo(() => activeKey === '' ? [] : activeKey.split(','), [activeKey])
   const scenarios = useMemo(() => payload.scenarios ?? [], [payload])
 
@@ -3115,6 +3214,8 @@ export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, 
         drawBarOpen={drawBarOpen}
         baseHeight={chartHeight}
         fill={fill}
+        forced={forceChips !== undefined}
+        overlay={overlay}
       />
       <div style={fill ? { flex: '0 1 auto', minHeight: 0, overflowY: 'auto' } : undefined}>
       {chipRow.length > 0
@@ -3241,9 +3342,14 @@ export function ChartCard(props: ToolCallViewProps): JSX.Element {
     [payload, settled, block],
   )
 
+  // Publishing stays ABOVE every early return: the column must still receive the
+  // chart when the card itself collapses to a receipt.
   useEffect(() => {
     if (publishPayload !== null) publishLatestChart(publishPayload)
   }, [publishPayload])
+
+  const columnOpen = useSyncExternalStore(subscribeColumn, getColumnOpen, getColumnOpen)
+  const [expanded, setExpanded] = useState(false)
 
   if (!settled) {
     return <div style={SHELL}>{toolName} …</div>
@@ -3253,6 +3359,14 @@ export function ChartCard(props: ToolCallViewProps): JSX.Element {
   }
   if (payload === null) {
     return <Fallback text={contentText(block.content)} error={false} />
+  }
+  if (cardView(columnOpen, expanded) === 'receipt') {
+    return (
+      <div style={RECEIPT} data-chart-receipt>
+        <span>{chartReceipt(toolName, payload)}</span>
+        <button type="button" style={RECEIPT_BUTTON} onClick={() => setExpanded(true)}>展开图表</button>
+      </div>
+    )
   }
   return <ViewportChartCard payload={payload} />
 }

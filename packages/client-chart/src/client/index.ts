@@ -11,7 +11,9 @@ import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client
 import type {} from '@dsh-trading/client-frame/client'
 import { ChartCard } from './ChartCard.js'
 import { ChartPanel } from './ChartPanel.js'
+import { createSessionFeedObservable, sendReply } from './dsh-session.js'
 import { createMarketClient } from './market-client.js'
+import { WalkthroughCard } from './WalkthroughCard.js'
 
 // The ecosystem seam: third-party dsh client plugins require
 // '@dsh-trading/client-chart/client' (mark it external in your bundle — the
@@ -25,6 +27,8 @@ export const name = 'client-chart'
 export const inject = ['slots', 'connection']
 
 const CHART_TOOLS = ['market_snapshot', 'get_ohlcv', 'annotate_chart', 'find_supply_demand_zones']
+// 'walkthrough' is registered separately below: it renders prose, not a chart,
+// and needs the session seam.
 
 // ponytail: ctx typed `any` — dsh 0.2 dropped dsh-client-runtime and ships no
 // plugin-facing Context augmentation for `slots` (same as client-frame).
@@ -32,11 +36,28 @@ const CHART_TOOLS = ['market_snapshot', 'get_ohlcv', 'annotate_chart', 'find_sup
 export function apply(ctx: any): void {
   // register() throws on undeclared slots — inject() waits for dsh-client-ui-tool
   // to declare 'tool.call.toolview' and re-runs across HMR redeclarations.
-  ctx.slots.inject('tool.call.toolview', () => CHART_TOOLS.map(key =>
+  ctx.slots.inject('tool.call.toolview', () => [
+    ...CHART_TOOLS.map(key =>
+      ctx.slots.register(
+        { name: 'tool.call.toolview', key, registrant: '@dsh-trading/client-chart' },
+        ChartCard,
+      )),
+    // The analyst's spoken sections. Replies and the conversation feed are bound
+    // here, where ctx lives; the sessions service is read at click time so a
+    // profile without it still loads this plugin.
     ctx.slots.register(
-      { name: 'tool.call.toolview', key, registrant: '@dsh-trading/client-chart' },
-      ChartCard,
-    )))
+      {
+        name: 'tool.call.toolview',
+        key: 'walkthrough',
+        registrant: '@dsh-trading/client-chart',
+        inject: (sessionId: string) => ({
+          ask: (text: string) => { void sendReply(ctx, sessionId, text) },
+          feed: createSessionFeedObservable(ctx, sessionId),
+        }),
+      },
+      WalkthroughCard,
+    ),
+  ])
 
   // The persistent column, claimed the same way: inject() means a profile
   // running dsh's stock frame (no `trading.chart` declarer) simply never runs
@@ -55,7 +76,11 @@ export function apply(ctx: any): void {
       {
         name: 'trading.chart',
         registrant: '@dsh-trading/client-chart',
-        inject: () => ({ market }),
+        inject: (sessionId?: string) => ({
+          market,
+          ask: sessionId === undefined ? undefined : (text: string) => { void sendReply(ctx, sessionId, text) },
+          feed: createSessionFeedObservable(ctx, sessionId),
+        }),
       },
       ChartPanel,
     ),
