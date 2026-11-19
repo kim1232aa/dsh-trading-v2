@@ -14,6 +14,7 @@ import {
   MAX_PANEL_BARS,
   readChartView,
   readOhlcvRequest,
+  readSearchRequest,
   resolveAgentPreset,
   serveMarketEndpoint,
 } from '../src/market-rpc.js'
@@ -61,6 +62,7 @@ describe('channel identity', () => {
       'ohlcv',
       'orderbook',
       'providers',
+      'search',
       'symbols',
       'view',
       'watchlist',
@@ -495,5 +497,77 @@ describe('chartPanelContextText preset gate', () => {
   it('resolveAgentPreset ignores non-strings', () => {
     expect(resolveAgentPreset({ agent: { session: { header: { agentPreset: 1 } } } })).toBeUndefined()
     expect(resolveAgentPreset({ agent: { session: { header: { agentPreset: '' } } } })).toBeUndefined()
+  })
+})
+
+describe('readSearchRequest', () => {
+  it('accepts free text and trims it', () => {
+    expect(readSearchRequest({ query: '  腾讯 ' })).toEqual({ query: '腾讯', providerId: undefined })
+  })
+
+  it('carries an explicit provider through', () => {
+    expect(readSearchRequest({ query: 'tesla', providerId: 'public' })).toEqual({ query: 'tesla', providerId: 'public' })
+  })
+
+  it.each([
+    [null, 'request must be an object'],
+    [{}, 'query must be a string'],
+    [{ query: 5 }, 'query must be a string'],
+    [{ query: '   ' }, 'query must not be empty'],
+    [{ query: 'x'.repeat(65) }, 'query is implausibly long'],
+    [{ query: 'a', providerId: 3 }, 'providerId must be a string'],
+  ])('rejects %j', (payload, message) => {
+    expect(readSearchRequest(payload)).toBe(message)
+  })
+})
+
+describe('serveMarketEndpoint: search', () => {
+  const hit = (symbol: string) => ({ symbol, name: symbol, assetClass: 'equity' })
+
+  it('routes through the hub and tags each hit with its owning provider', async () => {
+    const searchWithProvider = vi.fn(async () => [
+      { providerId: 'cn', item: hit('600519') },
+      { providerId: 'public', item: hit('US.MU') },
+    ])
+    const hub = { provider: vi.fn(), searchWithProvider } as unknown as MarketDataLike
+    const out = await serveMarketEndpoint(hub, ENDPOINTS.search, { query: '美光' })
+    expect(searchWithProvider).toHaveBeenCalledWith('美光', undefined)
+    expect(out).toEqual({
+      query: '美光',
+      items: [
+        { ...hit('600519'), providerId: 'cn' },
+        { ...hit('US.MU'), providerId: 'public' },
+      ],
+    })
+  })
+
+  it('passes an explicit provider id to the hub', async () => {
+    const searchWithProvider = vi.fn(async () => [])
+    const hub = { provider: vi.fn(), searchWithProvider } as unknown as MarketDataLike
+    await serveMarketEndpoint(hub, ENDPOINTS.search, { query: 'tsla', providerId: 'public' })
+    expect(searchWithProvider).toHaveBeenCalledWith('tsla', 'public')
+  })
+
+  it('falls back to the single provider when the hub has no searchWithProvider', async () => {
+    const search = vi.fn(async () => [hit('US.MU')])
+    const provider = vi.fn(() => ({ id: 'futu', description: 'x', search }))
+    const out = await serveMarketEndpoint({ provider } as unknown as MarketDataLike, ENDPOINTS.search, { query: 'mu' })
+    expect(out).toEqual({ query: 'mu', items: [{ ...hit('US.MU'), providerId: 'futu' }] })
+  })
+
+  it('answers with no items when the provider cannot search', async () => {
+    const provider = vi.fn(() => ({ id: 'csv', description: 'x' }))
+    const out = await serveMarketEndpoint({ provider } as unknown as MarketDataLike, ENDPOINTS.search, { query: 'mu' })
+    expect(out).toEqual({ query: 'mu', items: [] })
+  })
+
+  it('rejects a malformed request before touching any provider', async () => {
+    const provider = vi.fn()
+    const searchWithProvider = vi.fn()
+    await expect(
+      serveMarketEndpoint({ provider, searchWithProvider } as unknown as MarketDataLike, ENDPOINTS.search, { query: '' }),
+    ).rejects.toThrow('query must not be empty')
+    expect(provider).not.toHaveBeenCalled()
+    expect(searchWithProvider).not.toHaveBeenCalled()
   })
 })

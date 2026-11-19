@@ -54,6 +54,7 @@ export const ENDPOINTS = {
   watchlistRemove: 'watchlistRemove',
   largeOrders: 'largeOrders',
   cvd: 'cvd',
+  search: 'search',
 } as const
 
 /** The `providers` answer: list of registered providers and their descriptions. */
@@ -209,6 +210,12 @@ export interface SymbolsResponse {
   symbols: InstrumentInfo[]
 }
 
+/** What a name lookup resolved to; every hit names the feed that serves it. */
+export interface SearchResponse {
+  query: string
+  items: Array<InstrumentInfo & { providerId: string }>
+}
+
 /** The panel's view of a candle series. */
 export interface OhlcvResponse {
   providerId: string
@@ -347,10 +354,30 @@ export function chartPanelContextText(context: unknown, view: ChartView | undefi
 
 
 
+/**
+ * Validate a `search` request. Same rule as `ohlcv`: nothing unchecked from the
+ * browser reaches a provider, and this text goes on to become a URL query.
+ * @param payload - the decoded body.
+ * @returns the trimmed query (and optional provider), or a message naming what was wrong.
+ */
+export function readSearchRequest(payload: unknown): { query: string; providerId: string | undefined } | string {
+  if (typeof payload !== 'object' || payload === null) return 'request must be an object'
+  const body = payload as Record<string, unknown>
+  const q = body['query']
+  if (typeof q !== 'string') return 'query must be a string'
+  const query = q.trim()
+  if (query === '') return 'query must not be empty'
+  if (query.length > 64) return 'query is implausibly long'
+  const id = body['providerId']
+  if (id !== undefined && typeof id !== 'string') return 'providerId must be a string'
+  return { query, providerId: id }
+}
+
 /** The slice of the market-data hub this channel needs (kept narrow for testing). */
 export interface MarketDataLike {
   provider(id?: string): MarketDataProvider
   resolveProvider?(symbol?: string, explicitId?: string): MarketDataProvider
+  searchWithProvider?(query: string, providerId?: string): Promise<Array<{ providerId: string; item: InstrumentInfo }>>
   list?(): string[]
   getWatchlist?(): Promise<WatchlistResponse>
   addToWatchlist?(item: { symbol: string; group?: string | undefined; notes?: string | undefined }): Promise<boolean>
@@ -382,6 +409,7 @@ export async function serveMarketEndpoint(
   | FundamentalsResponse
   | ProvidersResponse
   | WatchlistResponse
+  | SearchResponse
   | { ok: boolean; symbol?: string | undefined }
   | { ok: true }
 > {
@@ -424,6 +452,19 @@ export async function serveMarketEndpoint(
     if (id !== undefined && typeof id !== 'string') throw new Error('providerId must be a string')
     const provider = marketData.provider(id)
     return { providerId: provider.id, description: provider.description, symbols: await provider.listSymbols() }
+  }
+
+  if (endpoint === ENDPOINTS.search) {
+    const request = readSearchRequest(payload)
+    if (typeof request === 'string') throw new Error(request)
+    if (typeof marketData.searchWithProvider === 'function') {
+      const hits = await marketData.searchWithProvider(request.query, request.providerId)
+      return { query: request.query, items: hits.map(h => ({ ...h.item, providerId: h.providerId })) }
+    }
+    // Hubs that only expose provider() (test fakes, older hosts): ask the one provider.
+    const provider = marketData.provider(request.providerId)
+    const items = provider.search === undefined ? [] : await provider.search(request.query)
+    return { query: request.query, items: items.map(item => ({ ...item, providerId: provider.id })) }
   }
 
   if (endpoint === ENDPOINTS.ohlcv) {

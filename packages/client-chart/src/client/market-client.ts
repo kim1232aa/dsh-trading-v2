@@ -30,6 +30,8 @@ export interface RpcCaller {
 /** One instrument as the host reports it. */
 export interface PanelInstrument {
   symbol: string
+  /** The feed that serves this instrument; set on search hits. */
+  providerId?: string
   name?: string
   assetClass?: string
   timeframes?: string[]
@@ -44,6 +46,11 @@ export interface MarketClient {
    */
   getBefore?(symbol: string, timeframe: string, beforeMs: number, bars: number, providerId?: string, signal?: AbortSignal): Promise<Candle[]>
   listSymbols(signal?: AbortSignal): Promise<{ providerId: string; description: string; symbols: PanelInstrument[] }>
+  /**
+   * Resolve free text (a name, a half-remembered ticker, a Chinese company) to
+   * instruments some feed can chart. Empty when nothing matched.
+   */
+  search(query: string, signalOrOpts?: AbortSignal | { providerId?: string; signal?: AbortSignal }): Promise<PanelInstrument[]>
   getPayload(symbol: string, timeframe: string, providerId?: string, signal?: AbortSignal): Promise<ChartPayload>
   /** The last few bars only — what a live refresh needs, without refetching the series. */
   getTail(symbol: string, timeframe: string, bars: number, providerId?: string, signal?: AbortSignal): Promise<Candle[]>
@@ -667,6 +674,36 @@ export function withCandles(payload: ChartPayload, candles: Candle[]): ChartPayl
   return { ...payload, timeframes: [{ ...tf, candles }, ...payload.timeframes.slice(1)] }
 }
 
+/**
+ * Lay a walkthrough section's indicator columns onto the column's own series.
+ *
+ * Matched by bar time, never by position: the section's columns cover the
+ * window the model read, the column's series is longer and keeps ticking, so
+ * position would shift every value by however many bars the two differ. Bars
+ * outside the section's window get no value rather than a recomputed one, so
+ * the pane shows exactly the numbers the model read and nothing else.
+ *
+ * @param payload - the column's live payload.
+ * @param series - the section's columns, keyed by bar open time.
+ * @returns the payload with those columns added, or the same one when there are none.
+ */
+export function withLessonSeries(
+  payload: ChartPayload,
+  series: { t: number[]; cols: Record<string, (number | null)[]> } | undefined,
+): ChartPayload {
+  const tf = payload.timeframes[0]
+  if (series === undefined || tf === undefined) return payload
+  const index = new Map(series.t.map((t, i) => [t, i]))
+  const cols: Record<string, (number | null)[]> = {}
+  for (const [name, col] of Object.entries(series.cols)) {
+    cols[name] = tf.candles.map(c => {
+      const i = index.get(Date.parse(c.time))
+      return i === undefined ? null : col[i] ?? null
+    })
+  }
+  return { ...payload, timeframes: [{ ...tf, series: { ...tf.series, ...cols } }, ...payload.timeframes.slice(1)] }
+}
+
 /* ------------------------------------------------------------------ */
 /* Agent marks: the drawings annotate_chart produced, lifted off its    */
 /* payload so they can be overlaid on the series the USER is watching.  */
@@ -1059,6 +1096,14 @@ export function createMarketClient(rpc: RpcCaller): MarketClient {
         symbols: PanelInstrument[]
       }
       return value
+    },
+
+    async search(query, signalOrOpts) {
+      const opts: { providerId?: string; signal?: AbortSignal } =
+        signalOrOpts instanceof AbortSignal ? { signal: signalOrOpts } : signalOrOpts ?? {}
+      const body = opts.providerId ? { query, providerId: opts.providerId } : { query }
+      const value = await unwrap(rpc.call(CHANNEL, 'search', body, opts.signal)) as { items: PanelInstrument[] }
+      return value.items
     },
 
     async getPayload(symbol, timeframe, providerId, signal) {
