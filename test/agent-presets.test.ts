@@ -52,3 +52,92 @@ describe('presets/*/agent.cordis.yml mirrors use prefix', () => {
     })
   }
 })
+
+/** Strip the common indent of a YAML block scalar body and join with \n. */
+function blockAt(lines: string[], start: number): string {
+  const ind = (lines[start]!.match(/^(\s*)/)![1] ?? '').length
+  const body: string[] = []
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i]!
+    if (l.trim() === '') { body.push(''); continue }
+    if ((l.match(/^(\s*)/)![1] ?? '').length <= ind) break
+    body.push(l)
+  }
+  while (body.length > 0 && body[body.length - 1] === '') body.pop()
+  const min = Math.min(...body.filter(l => l !== '').map(l => (l.match(/^(\s*)/)![1] ?? '').length))
+  return body.map(l => (l === '' ? '' : l.slice(min))).join('\n')
+}
+
+const norm = (s: string): string => s.replace(/\r\n/g, '\n')
+
+/** The persona prefix as the bundle patch ships it. */
+function patchPrefix(patch: string, id: 'trading' | 'analyst'): string {
+  const lines = norm(patch).split('\n')
+  const at = lines.findIndex(l => new RegExp(`id:\\s*preset-${id}\\b`).test(l))
+  const p = lines.findIndex((l, i) => i > at && /^\s+prefix:\s*\|/.test(l))
+  return blockAt(lines, p)
+}
+
+/** The persona prefix as presets/<id>/agent.cordis.yml mirrors it. */
+function mirrorPrefix(id: 'trading' | 'analyst'): string {
+  const lines = norm(readFileSync(join(root, 'presets', id, 'agent.cordis.yml'), 'utf8')).split('\n')
+  return blockAt(lines, lines.findIndex(l => /^\s+prefix:\s*\|/.test(l)))
+}
+
+function patchDescription(patch: string, id: 'trading' | 'analyst'): string {
+  const lines = norm(patch).split('\n')
+  const at = lines.findIndex(l => new RegExp(`id:\\s*preset-${id}\\b`).test(l))
+  const line = lines.find((l, i) => i > at && /^\s+description:/.test(l)) ?? ''
+  return line.replace(/^\s+description:\s*/, '').trim()
+}
+
+function presetYmlDescription(id: 'trading' | 'analyst'): string {
+  const line = norm(readFileSync(join(root, 'presets', id, 'preset.yml'), 'utf8')).split('\n').find(l => /^description:/.test(l)) ?? ''
+  return line.replace(/^description:\s*/, '').trim()
+}
+
+describe('presets tell the analysis through resolve_symbol + walkthrough', () => {
+  const patch = readFileSync(join(root, 'bundle/trading/cordis.patch.yml'), 'utf8')
+
+  for (const id of ['trading', 'analyst'] as const) {
+    it(`${id}: the bundle patch and the presets/ mirror carry the same persona`, () => {
+      expect(mirrorPrefix(id)).toBe(patchPrefix(patch, id))
+    })
+
+    it(`${id}: names go through resolve_symbol and the analysis is told with walkthrough`, () => {
+      const text = patchPrefix(patch, id)
+      expect(text).toContain('resolve_symbol')
+      expect(text).toContain('walkthrough')
+      expect(text).toContain('keep: true')
+      expect(text).toMatch(/\bask\b/)
+      expect(text).toContain('annotate_chart')
+    })
+
+    it(`${id}: preset.yml and the patch row describe the preset the same way`, () => {
+      expect(patchDescription(patch, id)).toBe(presetYmlDescription(id))
+    })
+  }
+
+  it('analyst: no second tool-market mount, and the description is the walkthrough one', () => {
+    expect(patch).not.toMatch(/analyst-tools/)
+    expect(presetYmlDescription('analyst')).toMatch(/talks you through your chart/)
+  })
+
+  it('trading: keeps the derivatives, structure and pattern disciplines', () => {
+    const text = patchPrefix(patch, 'trading')
+    for (const must of [
+      'market_snapshot', 'large_orders', 'find_swing_points', 'find_supply_demand_zones',
+      'screen_market', 'run_backtest', '艾略特', 'XABCD', 'Gartley', 'closesBeyond', 'get_chart_view',
+    ]) expect(text, must).toContain(must)
+  })
+
+  it('trading: supply and demand zones come only from find_supply_demand_zones', () => {
+    const text = patchPrefix(patch, 'trading')
+    expect(text).toMatch(/只能用 `find_supply_demand_zones`/)
+    expect(text).toMatch(/不叫供给区/)
+  })
+
+  it('trading: wall prints are never called support by themselves', () => {
+    expect(patchPrefix(patch, 'trading')).toMatch(/墙[^。\n]*(可随时撤|不等于支撑)/)
+  })
+})

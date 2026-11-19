@@ -32,6 +32,9 @@ importers:
       '@dsh-trading/provider-csv':
         specifier: workspace:^
         version: link:../../packages/provider-csv
+      '@dsh-trading/provider-public':
+        specifier: workspace:^
+        version: link:../../packages/provider-public
       '@dsh-trading/risk-guard':
         specifier: workspace:^
         version: link:../../packages/risk-guard
