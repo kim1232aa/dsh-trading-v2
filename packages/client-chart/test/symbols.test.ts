@@ -54,6 +54,37 @@ describe('readSymbolCandidates', () => {
   })
 })
 
+describe('exchange pairs', () => {
+  // The default feed is Binance, whose pairs run past the six characters a
+  // listing ticker needs: without this the reader's "ETHUSDT" opens nothing.
+  it('reads a spot pair as a symbol, whatever the case', () => {
+    expect(symbols('看看 ETHUSDT')).toEqual(['ETHUSDT'])
+    expect(symbols('btcusdt 怎么样')).toEqual(['BTCUSDT'])
+    expect(symbols('DOGEUSDT 现在')).toEqual(['DOGEUSDT'])
+    expect(symbols('1000PEPEUSDT')).toEqual(['1000PEPEUSDT'])
+  })
+
+  it('reads USDC, FDUSD and BUSD quotes too', () => {
+    expect(symbols('ETHUSDC')).toEqual(['ETHUSDC'])
+    expect(symbols('SOLFDUSD')).toEqual(['SOLFDUSD'])
+    expect(symbols('BNBBUSD')).toEqual(['BNBBUSD'])
+  })
+
+  it('does not take the quote currency alone, or glued text, for a pair', () => {
+    expect(symbols('USDT 的费率')).toEqual([])
+    expect(symbols('xETHUSDT')).toEqual([])
+    expect(symbols('ETHUSDTX')).toEqual([])
+  })
+
+  it('keeps the reader order between a pair and a name', () => {
+    expect(values('先看 ETHUSDT 再看 腾讯')).toEqual(['text:先看', 'symbol:ETHUSDT', 'text:再看', 'text:腾讯'])
+  })
+
+  it('reports a lower-case pair once, as the symbol', () => {
+    expect(values('ethusdt')).toEqual(['symbol:ETHUSDT'])
+  })
+})
+
 describe('normaliseBrokerSymbol', () => {
   it('rewrites broker notation into this feed notation', () => {
     expect(normaliseBrokerSymbol('US.MU')).toBe('MU')

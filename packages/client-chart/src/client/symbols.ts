@@ -44,6 +44,8 @@ const NOT_TICKERS = new Set([
   'BUY', 'SELL', 'LONG', 'SHORT', 'STOP', 'LIMIT', 'CALL', 'PUT', 'BID', 'ASK', 'SPREAD',
   // currencies and places
   'USD', 'CNY', 'HKD', 'EUR', 'JPY', 'GBP', 'US', 'HK', 'CN', 'SG', 'JP', 'UK', 'EU',
+  // stablecoin quotes: "USDT 的费率" is about the dollar token, not a listing
+  'USDT', 'USDC', 'FDUSD', 'BUSD', 'TUSD',
   // time
   'AM', 'PM', 'UTC', 'EST', 'ET', 'PT', 'YTD', 'QOQ', 'YOY', 'EOD', 'EOW', 'TODAY',
   'WEEK', 'MONTH', 'YEAR', 'NOW', 'NEXT', 'LAST', 'FIRST',
@@ -99,6 +101,15 @@ export function normaliseBrokerSymbol(symbol: string): string {
 /** A token that is already a symbol: `NVDA`, `0700.HK`, `BTC-USD`, `^GSPC`, `GC=F`. */
 const SYMBOL_PATTERN = /(?<![A-Za-z0-9.])(\$?(?:[A-Z]{2,6}=[XF]|\^?[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z0-9]{1,6})?))(?![A-Za-z0-9])/g
 
+/**
+ * An exchange pair: base plus quote, `ETHUSDT`, `1000PEPEUSDC`. Binance, the
+ * default feed, names instruments this way and its pairs outrun the six
+ * characters a listing ticker needs. The whole token must be one case — an
+ * upper- or lower-case pair, never `xETHUSDT` — and a quote with no base
+ * (`USDT`) is the currency, not an instrument.
+ */
+const PAIR_PATTERN = /(?<![A-Za-z0-9.])([A-Z0-9]{2,12}(?:USDT|USDC|FDUSD|BUSD)|[a-z0-9]{2,12}(?:usdt|usdc|fdusd|busd))(?![A-Za-z0-9])/g
+
 /** A Hong Kong / mainland listing: `0700.HK`, `600519.SS`, `300750.SZ`. */
 const NUMBERED_PATTERN = /(?<![A-Za-z0-9])(\d{4,6}\.(?:HK|SS|SZ|TW|T))(?![A-Za-z0-9])/gi
 
@@ -123,6 +134,13 @@ export function readSymbolCandidates(text: string): SymbolCandidate[] {
   const found: { at: number; candidate: SymbolCandidate }[] = []
 
   for (const match of text.matchAll(NUMBERED_PATTERN)) {
+    const token = match[1]
+    if (token !== undefined) found.push({ at: match.index, candidate: { value: token.toUpperCase(), kind: 'symbol' } })
+  }
+
+  // Before the other readers: at the same position the stable sort below then
+  // lets the pair win over the lower-case word reading of the same text.
+  for (const match of text.matchAll(PAIR_PATTERN)) {
     const token = match[1]
     if (token !== undefined) found.push({ at: match.index, candidate: { value: token.toUpperCase(), kind: 'symbol' } })
   }
