@@ -5,16 +5,16 @@ import { tmpdir } from 'node:os'
 import { generateKeyPairSync } from 'node:crypto'
 
 // Subsystem imports
-import { parseTencentQuote } from '../packages/provider-cn/src/index.js'
-import { screenUniverse, checkBullishAlignment } from '../packages/tool-market/src/screener.js'
-import { runBacktest, createDualEmaStrategy } from '../packages/tool-market/src/backtest-engine.js'
-import { validateFills } from '../packages/verdict/src/checks/fill-validation.js'
-import { AuthorityEngine, signGrant } from '../packages/authority/src/verifier.js'
-import type { TradingGrantPayload } from '../packages/authority/src/types.js'
-import { HoldingsStore } from '../packages/holdings/src/store.js'
-import { WatchlistStore } from '../packages/watchlist/src/store.js'
-import { KnowledgeStore } from '../packages/knowledge/src/store.js'
-import { TaskScheduler } from '../packages/tasks-schedule/src/scheduler.js'
+import { parseTencentQuote } from '../src/providers/cn.js'
+import { screenUniverse, checkBullishAlignment } from '../src/tools/screener.js'
+import { runBacktest, createDualEmaStrategy } from '../src/tools/backtest-engine.js'
+import { validateFills } from '../src/verdict/checks/fill-validation.js'
+import { AuthorityEngine, signGrant } from '../src/authority/verifier.js'
+import type { TradingGrantPayload } from '../src/authority/types.js'
+import { HoldingsStore } from '../src/holdings/store.js'
+import { WatchlistStore } from '../src/watchlist/store.js'
+import { KnowledgeStore } from '../src/knowledge/store.js'
+import { TaskScheduler } from '../src/tasks-schedule/scheduler.js'
 
 describe('Ecosystem Full-Lifecycle Integration', () => {
   it('connects data -> screener -> backtest -> audit -> authority -> holdings -> knowledge -> watchlist -> schedule', async () => {

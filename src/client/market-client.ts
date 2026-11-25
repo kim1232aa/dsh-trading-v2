@@ -1,0 +1,1303 @@
+/**
+ * Browser caller for the host's market-data channel, plus the adapter that
+ * turns raw candles into the payload {@link ChartBody} already knows how to
+ * draw. Keeping the adapter here means the panel has one rendering path
+ * whether its bars came from the user's own lookup or from a tool result.
+ * @module
+ */
+
+import { annotationDigest } from './payload.js'
+import type { ChartAnnotation, ChartPayload, ChartScenario } from './payload.js'
+import type { FundamentalsPackage, Orderbook } from '../market-data/index.js'
+
+/**
+ * Mirrors the host's `MARKET_CHANNEL`; duplicated rather than imported so the
+ * browser bundle stays free of host modules. Must stay a single path segment —
+ * the connection layer rejects anything else as an invalid RPC target.
+ */
+const CHANNEL = '/dsh-trading-market'
+
+/** The shape of `ctx.connection.rpc` this module needs. */
+export interface RpcCaller {
+  call(
+    channel: string,
+    endpoint: string,
+    payload: unknown,
+    signal?: AbortSignal,
+  ): Promise<{ ok: true; value: unknown } | { ok: false; error: { message: string } }>
+}
+
+/** One instrument as the host reports it. */
+export interface PanelInstrument {
+  symbol: string
+  /** The feed that serves this instrument; set on search hits. */
+  providerId?: string
+  name?: string
+  assetClass?: string
+  timeframes?: string[]
+}
+
+/** What the panel needs from the host; the whole surface the UI may touch. */
+export interface MarketClient {
+  listProviders?(signal?: AbortSignal): Promise<{ id: string; description: string; timeframes?: string[] }[]>
+  /**
+   * Bars strictly older than `beforeMs` (history paging for loadMore). Providers
+   * that ignore `end` return the latest window; {@link olderThan} drops those.
+   */
+  getBefore?(symbol: string, timeframe: string, beforeMs: number, bars: number, providerId?: string, signal?: AbortSignal): Promise<Candle[]>
+  listSymbols(signal?: AbortSignal): Promise<{ providerId: string; description: string; symbols: PanelInstrument[] }>
+  /**
+   * Resolve free text (a name, a half-remembered ticker, a Chinese company) to
+   * instruments some feed can chart. Empty when nothing matched.
+   */
+  search(query: string, signalOrOpts?: AbortSignal | { providerId?: string; signal?: AbortSignal }): Promise<PanelInstrument[]>
+  getPayload(symbol: string, timeframe: string, providerId?: string, signal?: AbortSignal): Promise<ChartPayload>
+  /** The last few bars only — what a live refresh needs, without refetching the series. */
+  getTail(symbol: string, timeframe: string, bars: number, providerId?: string, signal?: AbortSignal): Promise<Candle[]>
+  /**
+   * Tell the host what the panel is showing, so the agent sitting beside this
+   * chart can see it. Fire-and-forget: a failed publication must never disturb
+   * the chart the user is actually reading.
+   */
+  publishView(view: {
+    symbol: string
+    timeframe: string
+    bars: number
+    from?: string | undefined
+    to?: string | undefined
+    close?: number | undefined
+    live: boolean
+    origin: 'user' | 'agent' | 'followed'
+    marks?: number | undefined
+    marksDropped?: number | undefined
+    marksTimeframe?: string | undefined
+  }): void
+  /** Perpetual positioning (OI, funding, long/short). null when the provider has no futures data. */
+  getDerivatives(symbol: string, providerId?: string, signal?: AbortSignal): Promise<PanelDerivatives | null>
+  /** Perp + spot taker delta per bar (Binance only). null when the provider has none. */
+  getCvd?(symbol: string, timeframe: string, limit: number, providerId?: string, signal?: AbortSignal): Promise<PanelCvdBar[] | null>
+  /** Institutional & retail money flow (CN A-shares & equities). null when not supported. */
+  getMoneyFlow(symbol: string, providerId?: string, signal?: AbortSignal): Promise<PanelMoneyFlow | null>
+  /** Level 2 orderbook (5-10 levels depth). null when not supported. */
+  getOrderbook(symbol: string, providerId?: string, signal?: AbortSignal): Promise<Orderbook | null>
+  /** CoinGlass large resting walls. null/empty when unavailable. */
+  getLargeOrders?(
+    symbol: string,
+    opts?: {
+      hours?: number
+      top?: number
+      venue?: string
+      marketType?: 'all' | 'spot' | 'perp'
+      minUsd?: number
+      currentPrice?: number
+      maxDistancePct?: number
+      status?: 'active' | 'all' | 'revoked'
+      balanced?: boolean
+      /** Also return executed large trades at or above this USD size (0/omit = none). */
+      tradesMinUsd?: number
+      /** Spot-book overrides of minUsd / tradesMinUsd. */
+      spotMinUsd?: number
+      spotTradesMinUsd?: number
+    },
+    signal?: AbortSignal,
+  ): Promise<PanelLargeOrders | null>
+  /** Financial valuation & fundamentals (PE, PB, Market Cap). null when not supported. */
+  getFundamentals(symbol: string, providerId?: string, signal?: AbortSignal): Promise<FundamentalsPackage | null>
+  /** User custom watchlist items & groups from @dsh-trading/watchlist. */
+  getWatchlist?(signal?: AbortSignal): Promise<{ items: { symbol: string; group: string; notes?: string }[]; groups: string[] }>
+  /** Add a symbol to the custom watchlist. */
+  addToWatchlist?(symbol: string, group?: string, notes?: string): Promise<{ ok: boolean; symbol: string }>
+  /** Remove a symbol from the custom watchlist. */
+  removeFromWatchlist?(symbol: string): Promise<{ ok: boolean; symbol: string }>
+}
+
+/** One bar of perp/spot taker delta (主动买 − 主动卖, coins). */
+export interface PanelCvdBar {
+  time: string
+  perp: number | null
+  spot: number | null
+}
+
+/** Fold a short refresh (forming bar + any new ones) into the loaded series, by bar time. */
+export function mergeCvdBars(cur: readonly PanelCvdBar[], next: readonly PanelCvdBar[]): PanelCvdBar[] {
+  const byTime = new Map(cur.map(b => [b.time, b]))
+  for (const b of next) byTime.set(b.time, b)
+  return [...byTime.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time))
+}
+
+/** Institutional and retail order flow for equities. */
+export interface PanelMoneyFlow {
+  symbol: string
+  time?: string
+  netInflow: number
+  superLargeInflow?: number | null
+  largeInflow?: number | null
+  mediumInflow?: number | null
+  smallInflow?: number | null
+  mainRatioPct?: number | null
+  summary?: string
+}
+
+export interface PanelLargeOrderWall {
+  id: string | number
+  exchange: string
+  market?: 'spot' | 'perp' | string
+  side: 'buy' | 'sell'
+  price: number
+  currentUsd: number
+  startUsd: number
+  startTime: number
+  currentTime: number
+  state: number
+}
+
+/** One executed large trade (CoinGlass 大额成交). */
+export interface PanelLargeTrade {
+  id: string | number
+  exchange: string
+  market?: 'spot' | 'perp' | string
+  side: 'buy' | 'sell'
+  price: number
+  usd: number
+  amount: number
+  /** Fill time (ms). */
+  time: number
+}
+
+export interface PanelLargeOrders {
+  symbol: string
+  cgSymbol: string
+  pair: string
+  orderCount: number
+  updatedAt?: number
+  /** Served from the last good pull (CoinGlass rate limit / network); see updatedAt. */
+  stale?: boolean
+  /** Venue queries that failed this round. */
+  failedSources?: number
+  walls: PanelLargeOrderWall[]
+  /** Executed large trades, oldest first (only when tradesMinUsd was requested). */
+  trades?: PanelLargeTrade[]
+}
+
+/** Pill on the large-wall strip. `all` is the unfiltered book. */
+export type WallMarketFilter = 'all' | 'spot' | 'perp'
+
+/**
+ * Spot books from CoinGlass. `10` is the raw instrument type the capi still
+ * returns on some paths; everything else (including a missing tag) is treated
+ * as a contract book, matching the 现货/合约 caption drawn on the chart.
+ */
+export function isSpotWallMarket(market: string | undefined | null): boolean {
+  const m = (market ?? '').trim().toLowerCase()
+  return m === 'spot' || m === '10'
+}
+
+/** Keep walls that belong to the selected book. Order is preserved. */
+type ByBook<T> = { perp: T; spot: T }
+
+/** 大单墙 display, per book (合约/现货). */
+export interface WallDisplay {
+  wallMin: ByBook<number>
+  tradeMin: ByBook<number>
+  showWalls: ByBook<boolean>
+  showTrades: ByBook<boolean>
+}
+
+/**
+ * LARGE_WALLS params → USD thresholds and switches per book. The index layout
+ * is persisted in localStorage: append only, never reorder.
+ * [0 合约挂单最低万, 1 距离%, 2 单边条数, 3 合约成交最低万, 4 现货挂单最低万,
+ *  5 现货成交最低万, 6 合约挂单, 7 现货挂单, 8 合约成交, 9 现货成交]
+ */
+export function wallDisplay(params: readonly number[] | undefined): WallDisplay {
+  const p = (i: number, d: number): number => params?.[i] ?? d
+  return {
+    wallMin: { perp: p(0, 100) * 1e4, spot: p(4, 30) * 1e4 },
+    tradeMin: { perp: p(3, 50) * 1e4, spot: p(5, 20) * 1e4 },
+    showWalls: { perp: p(6, 1) === 1, spot: p(7, 1) === 1 },
+    showTrades: { perp: p(8, 1) === 1, spot: p(9, 1) === 1 },
+  }
+}
+
+/** Rows whose book is switched on and whose size clears that book's threshold. */
+export function displayedRows<T extends { market?: string | null }>(
+  rows: readonly T[], usd: (r: T) => number, show: ByBook<boolean>, min: ByBook<number>,
+): T[] {
+  return rows.filter(r => {
+    const k = isSpotWallMarket(r.market) ? 'spot' : 'perp'
+    return show[k] && usd(r) >= min[k]
+  })
+}
+
+export function filterWallsByMarket<T extends { market?: string | null }>(
+  walls: readonly T[],
+  filter: WallMarketFilter,
+): T[] {
+  if (filter === 'all') return walls.slice()
+  return walls.filter(w => filter === 'spot' ? isSpotWallMarket(w.market) : !isSpotWallMarket(w.market))
+}
+
+/**
+ * Default relative slack before a wall counts as crossed against live price.
+ * Zero means any ask strictly below `price` (which would draw as a red sell
+ * line underneath the candle with a `-0.x%` label) or bid strictly above
+ * `price` is hidden immediately.
+ */
+export const WALL_CROSS_TOLERANCE = 0
+
+/**
+ * Cross-venue / spot-vs-perp basis slack applied when checking whether a bar
+ * that opened AFTER `w.currentTime` swept through the wall on a wick and then
+ * pulled back (~5 bps = $1.1 on ETH at $2270).
+ */
+export const WALL_SWEEP_BASIS_SLACK = 0.0005
+
+export interface WallSweepCandle {
+  time: string | number
+  high: number
+  low: number
+}
+
+/** Venue snapshots in CoinGlass + secondary cache refresh within ~45 s. */
+export const SNAPSHOT_SWEEP_WINDOW_MS = 45_000
+
+export interface DropCrossedWallsOptions {
+  /** Relative slack for the live-price side check (default WALL_CROSS_TOLERANCE = 0). */
+  tol?: number
+  /**
+   * Optional series candles (ascending by open time). Any candle opening after
+   * the wall was last confirmed alive whose wick traded past `w.price` (beyond
+   * `sweepSlack`) swept the wall so it will not resurrect on a pullback.
+   */
+  candles?: readonly WallSweepCandle[]
+  /** Basis slack for post-snapshot wick sweeps (default WALL_SWEEP_BASIS_SLACK = 0.0005). */
+  sweepSlack?: number
+  /**
+   * Timestamp (ms) of the CoinGlass snapshot that still reported `state = 1`.
+   * Untouched orders keep their old `currentTime`, so sweeps older than
+   * `snapshotAt - 45 s` would already have removed the wall on CoinGlass.
+   */
+  snapshotAt?: number
+}
+
+function barOpenMs(t: string | number): number {
+  return typeof t === 'number' ? t : Date.parse(t)
+}
+
+/**
+ * A resting ask below the last trade, or a bid above it, cannot rest on the
+ * wrong side of the chart's market: price traded through it (filled or pulled)
+ * while CoinGlass has not refreshed that venue yet (~30 s venue batches + TTL).
+ */
+export function isWallCrossed(
+  w: { side: string; price: number },
+  price: number | undefined | null,
+  tol: number = WALL_CROSS_TOLERANCE,
+): boolean {
+  if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) return false
+  if (w.side === 'sell') return w.price < price * (1 - tol)
+  if (w.side === 'buy') return w.price > price * (1 + tol)
+  return false
+}
+
+/** True when a candle opening after the wall was last confirmed alive traded past `w.price`. */
+export function isWallSweptAfterSnapshot(
+  w: { side: string; price: number; currentTime?: number },
+  candles: readonly WallSweepCandle[] | undefined,
+  sweepSlack: number = WALL_SWEEP_BASIS_SLACK,
+  snapshotAt?: number,
+): boolean {
+  const wallCurMs = toEpochMs(w.currentTime)
+  const snapFloorMs = typeof snapshotAt === 'number' && Number.isFinite(snapshotAt) && snapshotAt > 0
+    ? toEpochMs(snapshotAt) - SNAPSHOT_SWEEP_WINDOW_MS
+    : 0
+  const seenAt = Math.max(wallCurMs, snapFloorMs)
+  if (!candles?.length || seenAt <= 0) return false
+  const askCeil = w.price * (1 + sweepSlack)
+  const bidFloor = w.price * (1 - sweepSlack)
+  // Candles are ascending; walk from the tail and stop as soon as open < seenAt.
+  for (let i = candles.length - 1; i >= 0; i--) {
+    const c = candles[i]!
+    const openMs = barOpenMs(c.time)
+    if (!Number.isFinite(openMs) || openMs < seenAt) break
+    if (w.side === 'sell' && c.high > askCeil) return true
+    if (w.side === 'buy' && c.low < bidFloor) return true
+  }
+  return false
+}
+
+/** Walls still intact and on the right side of the last price. Order is preserved. */
+export function dropCrossedWalls<T extends { side: string; price: number; currentTime?: number }>(
+  walls: readonly T[],
+  price: number | undefined | null,
+  optsOrTol: number | DropCrossedWallsOptions = WALL_CROSS_TOLERANCE,
+): T[] {
+  const opts: DropCrossedWallsOptions = typeof optsOrTol === 'number' ? { tol: optsOrTol } : optsOrTol
+  const tol = opts.tol ?? WALL_CROSS_TOLERANCE
+  const sweepSlack = opts.sweepSlack ?? WALL_SWEEP_BASIS_SLACK
+  return walls.filter(w => !isWallCrossed(w, price, tol) && !isWallSweptAfterSnapshot(w, opts.candles, sweepSlack, opts.snapshotAt))
+}
+
+function toEpochMs(t: number | undefined): number {
+  if (typeof t !== 'number' || !Number.isFinite(t) || t <= 0) return 0
+  return t < 1e11 ? t * 1000 : t
+}
+
+/** Elapsed resting age in seconds, or null when `startTime` is absent. */
+export function wallAgeSeconds(
+  w: { startTime?: number; currentTime?: number; state?: number },
+  nowMs: number = Date.now(),
+): number | null {
+  const startMs = toEpochMs(w.startTime)
+  if (startMs <= 0) return null
+  const curMs = toEpochMs(w.currentTime)
+  const revoked = w.state === 2 || w.state === 3
+  // Active (state=1) orders are still resting on the book even after a partial
+  // fill updated currentTime; revoked orders ended at currentTime.
+  const endMs = revoked
+    ? (curMs > startMs ? curMs : nowMs)
+    : Math.max(nowMs, curMs)
+  return Math.max(0, Math.floor((endMs - startMs) / 1000))
+}
+
+/**
+ * Human-readable Chinese resting duration for a CoinGlass order wall.
+ * `compact = true` drops noisy sub-minute/sub-hour remainders for chart lines & strip badges.
+ */
+export function formatWallAge(
+  w: { startTime?: number; currentTime?: number; state?: number },
+  nowMs: number = Date.now(),
+  compact = false,
+): string {
+  const sec = wallAgeSeconds(w, nowMs)
+  if (sec === null) return ''
+  if (sec < 60) return `${sec}秒`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return compact ? `${min}分` : `${min}分${sec % 60}秒`
+  const hr = Math.floor(min / 60)
+  const remMin = min % 60
+  if (hr < 24) {
+    if (compact) return remMin === 0 ? `${hr}小时` : `${hr}时${remMin}分`
+    return `${hr}小时${remMin}分`
+  }
+  const day = Math.floor(hr / 24)
+  const remHr = hr % 24
+  if (compact) return remHr === 0 ? `${day}天` : `${day}天${remHr}时`
+  return `${day}天${remHr}小时`
+}
+
+export interface PanelPositionReading {
+  id: string
+  label: string
+  note: string
+  tone: 'neutral' | 'warn'
+}
+
+export interface PanelDerivativeBar {
+  time: string
+  openInterest: number | null
+  openInterestValue: number | null
+  longShortRatio: number | null
+  topPositionRatio?: number | null
+  topAccountRatio?: number | null
+  takerBuySellRatio: number | null
+  posture?: string | null
+  quadrant?: string | null
+  quadrantNote?: string | null
+  crowdVsWhale?: string | null
+  readings?: PanelPositionReading[]
+}
+
+/**
+ * Match a derivative history bar to a candle open time.
+ * - No interval (or ≤15m): latest snapshot at or before the candle open, no more than 15 minutes old.
+ * - Larger candles (1h/4h/1d): the LAST snapshot inside [open, open+interval) —
+ *   a 1d candle otherwise almost never lines up with a 5m snapshot.
+ */
+export function matchDerivativeHistory(
+  history: PanelDerivativeBar[],
+  timestampMs: number,
+  intervalMs?: number,
+): PanelDerivativeBar | undefined {
+  if (intervalMs !== undefined && intervalMs > 900_000) {
+    let best: PanelDerivativeBar | undefined
+    let bestT = -Infinity
+    for (const h of history) {
+      const t = Date.parse(h.time)
+      if (!Number.isFinite(t) || t < timestampMs || t >= timestampMs + intervalMs) continue
+      if (t > bestT) { bestT = t; best = h }
+    }
+    return best
+  }
+  const kSec = Math.floor(timestampMs / 1000)
+  let bestDiff = Infinity
+  let matched: PanelDerivativeBar | undefined
+  for (const h of history) {
+    const sec = Math.floor(Date.parse(h.time) / 1000)
+    if (!Number.isFinite(sec)) continue
+    const diff = kSec - sec
+    if (diff >= 0 && diff < bestDiff && diff <= 900) {
+      bestDiff = diff
+      matched = h
+    }
+  }
+  return matched
+}
+
+/** Select historical data even when a hovered candle has no matching snapshot. */
+export function derivativesForTime(
+  live: PanelDerivatives | undefined,
+  timestampMs: number | null | undefined,
+  intervalMs?: number,
+): PanelDerivatives | HistoricalDerivatives | undefined {
+  if (!live || timestampMs == null || !Number.isFinite(timestampMs)) return live
+  return derivativesAtBar(live, matchDerivativeHistory(live.history ?? [], timestampMs, intervalMs), timestampMs)
+}
+
+const QUADRANT_NOTES: Record<string, string> = {
+  '强多头': '多头真金白银主动开仓推高，趋势健康',
+  '弱反弹 / 轧空': '空头止损平仓推动，容易衰竭',
+  '强空头': '空头主动大举增仓砸盘，下跌动能足',
+  '多头踩踏': '多头爆仓或割肉平仓，属于杀多行情',
+}
+
+/** Price × OI posture measured over one window (the chart's own bar length). */
+export interface WindowPosture {
+  label: string
+  note: string | null
+  oiPct: number
+  pxPct: number
+}
+
+/**
+ * Price × OI posture over `windowMs`, ending at `end` (the live snapshot or a
+ * hovered bar). The provider's label is fixed at 1h, so on a 5m chart it never
+ * moves; this re-measures against the 5m OI history at the chart's own window.
+ * Dead zones scale with the window (1h: price 0.1% / OI 0.3%, same as the provider).
+ * @returns null when the history has no anchor near `end - windowMs`.
+ */
+export function windowPosture(
+  history: readonly PanelDerivativeBar[],
+  end: { time: string; openInterest: number | null; openInterestValue: number | null },
+  windowMs: number,
+): WindowPosture | null {
+  const endMs = Date.parse(end.time)
+  const endOi = end.openInterest
+  const endVal = end.openInterestValue
+  if (!Number.isFinite(endMs) || endOi === null || endVal === null || !(endOi > 0) || !(endVal > 0)) return null
+  const cutoff = endMs - windowMs
+  let past: PanelDerivativeBar | undefined
+  let pastMs = -Infinity
+  for (const h of history) {
+    const t = Date.parse(h.time)
+    if (Number.isFinite(t) && t <= cutoff && t > pastMs) { past = h; pastMs = t }
+  }
+  // ponytail: tolerates a 10-min gap in the 5m history; a longer hole returns null (strip falls back to the provider's 1h label).
+  if (past === undefined || cutoff - pastMs > 600_000) return null
+  const pOi = past.openInterest
+  const pVal = past.openInterestValue
+  if (pOi === null || pVal === null || !(pOi > 0) || !(pVal > 0)) return null
+  const oiPct = (endOi / pOi - 1) * 100
+  const pxPct = ((endVal / endOi) / (pVal / pOi) - 1) * 100
+  const k = Math.min(1, windowMs / 3_600_000)
+  const pz = Math.max(0.02, 0.1 * k)
+  const oz = Math.max(0.05, 0.3 * k)
+  let label: string
+  if (Math.abs(oiPct) < oz) label = '持仓持平'
+  else if (Math.abs(pxPct) < pz) label = oiPct > 0 ? '价平增仓' : '价平减仓'
+  else if (pxPct > 0) label = oiPct > 0 ? '强多头' : '弱反弹 / 轧空'
+  else label = oiPct > 0 ? '强空头' : '多头踩踏'
+  return { label, note: QUADRANT_NOTES[label] ?? null, oiPct, pxPct }
+}
+
+/** What the strip shows while the crosshair sits on a historical bar. */
+export interface HistoricalDerivatives extends Omit<PanelDerivatives, 'history'> {
+  isHistorical: true
+}
+
+/**
+ * The strip's view of one historical bar. Every per-bar field comes from the
+ * bar alone — a missing value stays null ("—"), never the live snapshot,
+ * otherwise the flat line comes back. Funding / next funding are snapshot-only.
+ */
+export function derivativesAtBar(live: PanelDerivatives | undefined, bar: PanelDerivativeBar | undefined, timestampMs?: number): HistoricalDerivatives {
+  return {
+    source: live?.source ?? '',
+    ...(live?.longShortRatioKind ? { longShortRatioKind: live.longShortRatioKind } : {}),
+    readings: bar?.readings ?? [],
+    openInterest: bar?.openInterest ?? null,
+    openInterestValue: bar?.openInterestValue ?? null,
+    fundingRate: live?.fundingRate ?? null,
+    nextFundingTime: live?.nextFundingTime ?? null,
+    longShortRatio: bar?.longShortRatio ?? null,
+    takerBuySellRatio: bar?.takerBuySellRatio ?? null,
+    topPositionRatio: bar?.topPositionRatio ?? null,
+    topAccountRatio: bar?.topAccountRatio ?? null,
+    crowdVsWhale: bar?.crowdVsWhale ?? null,
+    time: bar?.time ?? (timestampMs !== undefined ? new Date(timestampMs).toISOString() : ''),
+    posture: bar?.posture ?? null,
+    quadrant: bar?.quadrant ?? null,
+    quadrantNote: bar?.quadrantNote ?? null,
+    oiChangePct1h: null,
+    priceChangePct1h: null,
+    isHistorical: true,
+  }
+}
+
+/** Mirrors `Derivatives` from @dsh-trading/market-data; duplicated to keep host modules out of the browser bundle. */
+export interface PanelDerivatives {
+  source: string
+  openInterest: number | null
+  openInterestValue: number | null
+  oiUnit?: 'base'
+  fundingRate: number | null
+  fundingRateAnnualizedPct?: number | null
+  fundingLabel?: string | null
+  nextFundingTime: string | null
+  longShortRatio: number | null
+  longShortRatioKind?: 'global_accounts' | 'top_accounts' | 'top_positions' | 'unknown'
+  topPositionRatio?: number | null
+  topAccountRatio?: number | null
+  takerBuySellRatio: number | null
+  cvd1h?: number | null
+  cvdNote?: string | null
+  basisPct?: number | null
+  time: string
+  oiChangePct1h?: number | null
+  oiChangePct4h?: number | null
+  oiChangePct24h?: number | null
+  netPositionDelta1h?: number | null
+  topLongDelta1h?: number | null
+  topShortDelta1h?: number | null
+  priceChangePct1h?: number | null
+  priceChangePct4h?: number | null
+  priceChangePct24h?: number | null
+  posture?: string | null
+  quadrant?: string | null
+  quadrantNote?: string | null
+  crowdVsWhale?: string | null
+  readings?: PanelPositionReading[]
+  history?: PanelDerivativeBar[]
+  liquidationLongUsd1h?: number | null
+  liquidationShortUsd1h?: number | null
+  liquidationSummary?: string | null
+  liquidationSource?: string | null
+}
+
+/** One bar, as the seam defines it. */
+type Candle = ChartPayload['timeframes'][number]['candles'][number]
+
+/**
+ * Fold freshly fetched tail bars into an existing series.
+ *
+ * Bars are keyed by open time, so a bar that is still forming REPLACES its
+ * earlier self and a bar that has just opened is appended. That distinction is
+ * the whole job: append blindly and a live chart grows a duplicate candle
+ * every poll; replace blindly and it never gains a new one.
+ *
+ * @param series - the current ascending candles.
+ * @param tail - freshly fetched bars, ascending.
+ * @returns the merged series, ascending, or the original reference when nothing moved.
+ */
+export function mergeTail(series: readonly Candle[], tail: readonly Candle[]): Candle[] {
+  if (tail.length === 0) return series as Candle[]
+  const byTime = new Map(series.map(c => [c.time, c]))
+  let changed = false
+  for (const bar of tail) {
+    const existing = byTime.get(bar.time)
+    if (existing === undefined) {
+      changed = true
+    } else if (
+      existing.open !== bar.open || existing.high !== bar.high
+      || existing.low !== bar.low || existing.close !== bar.close || existing.volume !== bar.volume
+    ) {
+      changed = true
+    }
+    byTime.set(bar.time, bar)
+  }
+  if (!changed) return series as Candle[]
+  return [...byTime.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time))
+}
+
+/**
+ * Keep only bars that open strictly before `beforeMs`, ascending, de-duplicated.
+ * A provider that ignores the `end` bound hands back the latest window; this
+ * turns that into "nothing older", which stops paging instead of corrupting it.
+ */
+export function olderThan(candles: readonly Candle[], beforeMs: number): Candle[] {
+  const seen = new Set<string>()
+  return candles
+    .filter(c => { const t = Date.parse(c.time); return Number.isFinite(t) && t < beforeMs && !seen.has(c.time) && (seen.add(c.time), true) })
+    .sort((a, b) => Date.parse(a.time) - Date.parse(b.time))
+}
+
+/** Every period the panel toolbar can offer, in display order. */
+export const PANEL_TIMEFRAMES = [
+  '1m', '3m', '5m', '15m', '30m',
+  '1h', '2h', '4h', '6h', '8h', '12h',
+  '1d', '3d', '1w', '1M',
+] as const
+
+/** Known gaps when the host does not report a provider's timeframes. */
+const FALLBACK_TIMEFRAMES: Record<string, readonly string[]> = {
+  // Mirrors provider-cn ALL_CN_TIMEFRAMES; the RPC answer overrides it.
+  cn: ['1m', '5m', '15m', '30m', '1h', '1d', '1w'],
+  okx: ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w', '1M'],
+}
+
+/**
+ * Toolbar periods for the active data source. The provider's own advertised
+ * list (from the `providers` RPC, i.e. listSymbols) is the source of truth;
+ * the static fallback only covers hosts that did not report one.
+ */
+export function timeframesForSource(
+  source: string,
+  providers: readonly { id: string; timeframes?: readonly string[] | undefined }[],
+): string[] {
+  const reported = providers.find(p => p.id === source)?.timeframes
+  const allow = reported !== undefined && reported.length > 0 ? reported : FALLBACK_TIMEFRAMES[source]
+  if (allow === undefined) return [...PANEL_TIMEFRAMES]
+  const set = new Set(allow)
+  const out = PANEL_TIMEFRAMES.filter(tf => set.has(tf))
+  return out.length > 0 ? out : [...PANEL_TIMEFRAMES]
+}
+
+/**
+ * Replace a payload's candle series, keeping everything else identical.
+ * @param payload - the payload to refresh.
+ * @param candles - the merged series.
+ * @returns a new payload, or the original when the series did not move.
+ */
+export function withCandles(payload: ChartPayload, candles: Candle[]): ChartPayload {
+  const tf = payload.timeframes[0]
+  if (tf === undefined || tf.candles === candles) return payload
+  return { ...payload, timeframes: [{ ...tf, candles }, ...payload.timeframes.slice(1)] }
+}
+
+/**
+ * Lay a walkthrough section's indicator columns onto the column's own series.
+ *
+ * Matched by bar time, never by position: the section's columns cover the
+ * window the model read, the column's series is longer and keeps ticking, so
+ * position would shift every value by however many bars the two differ. Bars
+ * outside the section's window get no value rather than a recomputed one, so
+ * the pane shows exactly the numbers the model read and nothing else.
+ *
+ * @param payload - the column's live payload.
+ * @param series - the section's columns, keyed by bar open time.
+ * @returns the payload with those columns added, or the same one when there are none.
+ */
+export function withLessonSeries(
+  payload: ChartPayload,
+  series: { t: number[]; cols: Record<string, (number | null)[]> } | undefined,
+): ChartPayload {
+  const tf = payload.timeframes[0]
+  if (series === undefined || tf === undefined) return payload
+  const index = new Map(series.t.map((t, i) => [t, i]))
+  const cols: Record<string, (number | null)[]> = {}
+  for (const [name, col] of Object.entries(series.cols)) {
+    cols[name] = tf.candles.map(c => {
+      const i = index.get(Date.parse(c.time))
+      return i === undefined ? null : col[i] ?? null
+    })
+  }
+  return { ...payload, timeframes: [{ ...tf, series: { ...tf.series, ...cols } }, ...payload.timeframes.slice(1)] }
+}
+
+/* ------------------------------------------------------------------ */
+/* Agent marks: the drawings annotate_chart produced, lifted off its    */
+/* payload so they can be overlaid on the series the USER is watching.  */
+/* ------------------------------------------------------------------ */
+
+/** Marks lifted off an agent payload, normalised and content-keyed. */
+export interface ChartMarks {
+  /** `provider|SYMBOL|timeframe|digest` — content identity, not object identity. */
+  key: string
+  provider: string
+  /** Normalised for matching only: trimmed and upper-cased. */
+  symbol: string
+  /**
+   * The symbol as the producer wrote it, trimmed. Instrument codes are
+   * case-sensitive at the provider (Futu keeps the code's case and only
+   * upper-cases the market prefix), so the normalised form above is a
+   * comparison key and must never be handed back to a lookup.
+   */
+  rawSymbol: string
+  timeframe: string
+  annotations: ChartAnnotation[]
+  scenarios: ChartScenario[]
+  /** Local clock when these marks were adopted, for the pill. */
+  at: string
+}
+
+/** Outcome of trying to draw marks on a series. */
+export interface MergeMarksResult {
+  /** The payload to render — the SAME reference when nothing was drawn. */
+  payload: ChartPayload
+  /** Whether the marks are about this exact chart. */
+  applied: boolean
+  kept: number
+  dropped: number
+}
+
+/**
+ * Lift drawings off an agent payload, or null when it carries no replacement.
+ * Explicit replaceMarks results may carry an empty set after candidate invalidation.
+ *
+ * `market_snapshot` and `get_ohlcv` payloads have neither annotations nor
+ * scenarios, so they can never blank existing marks — the panel's adoption
+ * effect relies on that.
+ *
+ * @param payload - the newest payload a chat card rendered.
+ * @returns normalised marks, or null when there is nothing to adopt.
+ */
+export function readMarks(payload: ChartPayload | null): ChartMarks | null {
+  if (payload === null) return null
+  const tf = payload.timeframes.find(t => (t.annotations?.length ?? 0) > 0) ?? payload.timeframes[0]
+  if (tf === undefined) return null
+  const annotations = [...tf.annotations ?? []]
+  const scenarios = [...payload.scenarios ?? []]
+  if (annotations.length === 0 && scenarios.length === 0 && payload.replaceMarks !== true) return null
+  const rawSymbol = payload.symbol.trim()
+  const symbol = rawSymbol.toUpperCase()
+  return {
+    key: `${payload.provider}|${symbol}|${tf.timeframe}|${annotationDigest(annotations, scenarios)}`,
+    provider: payload.provider,
+    symbol,
+    rawSymbol,
+    timeframe: tf.timeframe,
+    annotations,
+    scenarios,
+    at: new Date().toLocaleTimeString(),
+  }
+}
+
+function isCandidateZoneAnnotation(a: ChartAnnotation): boolean {
+  return a.type === 'zone' && typeof (a as unknown as Record<string, unknown>)['availableAt'] === 'string'
+}
+
+/**
+ * Combine existing marks with a newly arrived tool payload for the same symbol so
+ * rule-verified supply/demand candidates (`find_supply_demand_zones`, which sets
+ * `replaceMarks: true`) and structural drawings (`annotate_chart`) coexist instead
+ * of wiping each other out when called in sequence.
+ */
+export function combineMarks(
+  cur: ChartMarks | null,
+  next: ChartMarks,
+  isCandidateZonePayload: boolean,
+): ChartMarks {
+  if (cur === null || cur.provider !== next.provider || cur.symbol !== next.symbol) {
+    return next
+  }
+  const annotations = isCandidateZonePayload
+    ? [...cur.annotations.filter(a => !isCandidateZoneAnnotation(a)), ...next.annotations]
+    : [...cur.annotations.filter(isCandidateZoneAnnotation), ...next.annotations]
+  const scenarios = isCandidateZonePayload && next.scenarios.length === 0
+    ? cur.scenarios
+    : next.scenarios
+  const timeframe = isCandidateZonePayload && next.annotations.length === 0 && cur.annotations.some(a => !isCandidateZoneAnnotation(a))
+    ? cur.timeframe
+    : next.timeframe
+  return {
+    ...next,
+    timeframe,
+    annotations,
+    scenarios,
+    key: `${next.provider}|${next.symbol}|${timeframe}|${annotationDigest(annotations, scenarios)}`,
+  }
+}
+
+/** Plausibility band, mirroring the producer's own validation. */
+function band(role: unknown, lo: number, hi: number, isCrossTf = false): { floor: number; ceil: number } {
+  const wide = role === 'target' || role === 'invalidation'
+  if (isCrossTf) {
+    // Projection and invalidation targets legitimately span beyond local candle swings;
+    // keep the wide 0.5..2.0 band so projected scripts and target zones remain visible
+    // across lower timeframes without being dropped as out-of-band noise.
+    if (wide) {
+      return { floor: lo * 0.5, ceil: hi * 2.0 }
+    }
+    // For ordinary support/resistance levels, limit proximity to prevent far-away macro lines
+    // from cluttering lower-timeframe views.
+    const pad = Math.max((hi - lo) * 0.3, (hi + lo) * 0.015)
+    return { floor: lo - pad, ceil: hi + pad }
+  }
+  return wide ? { floor: lo * 0.5, ceil: hi * 2.0 } : { floor: lo * 0.7, ceil: hi * 1.3 }
+}
+
+function inBand(price: unknown, role: unknown, lo: number, hi: number, isCrossTf = false): boolean {
+  if (typeof price !== 'number' || !Number.isFinite(price)) return false
+  const { floor, ceil } = band(role, lo, hi, isCrossTf)
+  return price >= floor && price <= ceil
+}
+
+/**
+ * Clip a polyline to [firstMs, lastMs] by linear interpolation at the window
+ * boundaries. Prevents klinecharts' nearest-bar lookup from collapsing multiple
+ * forward-projected vertices onto the final candle (which creates vertical kinks)
+ * and allows higher-timeframe trendlines to remain visible on lower-timeframe views.
+ */
+type PathPoint = { time: string; price: number; note?: string }
+type ParsedPathPoint = PathPoint & { t: number }
+
+const stripT = (p: ParsedPathPoint): PathPoint =>
+  p.note !== undefined ? { time: p.time, price: p.price, note: p.note } : { time: p.time, price: p.price }
+
+/** Scripted/projected paths may run this many bars past the last candle (mirrors annotate_chart). */
+export const PATH_FORWARD_BARS = 150
+
+function clipPathToWindow(
+  pts: readonly ParsedPathPoint[],
+  firstMs: number,
+): PathPoint[] {
+  if (pts.length < 2) return []
+  // If no point sits before firstMs, keep all authored vertices without clipping.
+  const allAfterStart = pts.every((p, idx) =>
+    p.t >= firstMs && (idx === 0 || p.t > pts[idx - 1]!.t))
+  if (allAfterStart) return pts.map(stripT)
+
+  const out: ParsedPathPoint[] = []
+  // Only an original vertex keeps its note; an interpolated window edge has none.
+  const pushPt = (time: string, t: number, price: number, note?: string): void => {
+    const rounded = Number(price.toPrecision(8)) || 0
+    const prev = out[out.length - 1]
+    const keep = note ?? (prev !== undefined && Math.abs(prev.t - t) < 1 ? prev.note : undefined)
+    const pt: ParsedPathPoint = keep !== undefined ? { time, t, price: rounded, note: keep } : { time, t, price: rounded }
+    if (prev !== undefined && Math.abs(prev.t - t) < 1) {
+      out[out.length - 1] = pt
+      return
+    }
+    out.push(pt)
+  }
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i]!
+    const b = pts[i + 1]!
+    if (b.t <= a.t) continue
+    if (b.t < firstMs) continue
+
+    const t0 = Math.max(firstMs, a.t)
+    const t1 = b.t
+    if (t1 < t0) continue
+
+    const p0 = t0 === a.t ? a.price : a.price + (b.price - a.price) * ((t0 - a.t) / (b.t - a.t))
+    const p1 = b.price
+    const s0 = t0 === a.t ? a.time : new Date(t0).toISOString()
+    const s1 = b.time
+
+    pushPt(s0, t0, p0, t0 === a.t ? a.note : undefined)
+    pushPt(s1, t1, p1, b.note)
+  }
+  return out.length >= 2 ? out.map(stripT) : []
+}
+
+/**
+ * Draw an agent's marks onto the user's series — but only when they are about
+ * that exact chart.
+ *
+ * The predicate is deliberately strict: same provider, same symbol
+ * (case-insensitively), same timeframe. A price level is meaningful on any
+ * timeframe in the abstract, but klinecharts scales its price axis to the
+ * VISIBLE candles, so a level lifted onto a different window can sit off-pane
+ * while its row in the table below still prints a price and a distance. Half a
+ * drawing that disagrees with its own caption is the failure this feature
+ * exists to prevent; the panel offers to switch the chart instead.
+ *
+ * Survivors are additionally range-gated against the user's own candles. The
+ * producer validated every price against ITS window; at equal timeframe the
+ * user's window is a superset, so this is defense in depth rather than a
+ * second opinion — but a mark it refuses is one that would have been drawn
+ * outside the plot.
+ *
+ * Indicators and per-bar series are never copied: they are aligned
+ * index-for-index with the agent's own (shorter) window and are read
+ * positionally, so importing them would shift indicator panes by hundreds of
+ * bars and print numbers that look real.
+ *
+ * @param payload - the user's live payload.
+ * @param marks - the agent's drawings.
+ * @returns the payload to render plus what happened, for the UI to report.
+ */
+export function mergeMarks(payload: ChartPayload, marks: ChartMarks): MergeMarksResult {
+  const tf = payload.timeframes[0]
+  const refused: MergeMarksResult = { payload, applied: false, kept: 0, dropped: 0 }
+  if (tf === undefined) return refused
+  if (payload.provider !== marks.provider) return refused
+  if (payload.symbol.trim().toUpperCase() !== marks.symbol) return refused
+
+  const candles = tf.candles
+  if (candles.length === 0) return { payload, applied: true, kept: 0, dropped: 0 }
+  let lo = Infinity
+  let hi = -Infinity
+  for (const c of candles) {
+    if (c.low < lo) lo = c.low
+    if (c.high > hi) hi = c.high
+  }
+  const firstMs = Date.parse(candles[0]!.time)
+  const lastMs = Date.parse(candles[candles.length - 1]!.time)
+  const barMs = candles.length >= 2 ? lastMs - Date.parse(candles[candles.length - 2]!.time) : 0
+  const forwardMs = Math.max((lastMs - firstMs) * 0.1, Number.isFinite(barMs) && barMs > 0 ? barMs * PATH_FORWARD_BARS : 0)
+
+  let dropped = 0
+  const isCrossTf = tf.timeframe !== marks.timeframe
+  const kept: ChartAnnotation[] = []
+  for (const a of marks.annotations) {
+    const record = a as unknown as Record<string, unknown>
+    const role = record['role']
+    if (a.type === 'level') {
+      if (inBand(record['price'], role, lo, hi, isCrossTf)) kept.push(a)
+      else dropped += 1
+    } else if (a.type === 'zone') {
+      const availableAt = record['availableAt']
+      // A candidate's confirmation must be known; path projection tolerance cannot reveal it early.
+      const known = availableAt === undefined || (typeof availableAt === 'string'
+        && Number.isFinite(Date.parse(availableAt)) && Date.parse(availableAt) <= lastMs)
+      if (known && inBand(record['low'], role, lo, hi, isCrossTf) && inBand(record['high'], role, lo, hi, isCrossTf)) kept.push(a)
+      else dropped += 1
+    } else if (a.type === 'path') {
+      const points = Array.isArray(record['points']) ? record['points'] : []
+      const parsed: ParsedPathPoint[] = []
+      let validRaw = points.length >= 2
+      for (const p of points) {
+        if (typeof p !== 'object' || p === null) { validRaw = false; break }
+        const pt = p as Record<string, unknown>
+        const t = typeof pt['time'] === 'string' ? Date.parse(pt['time']) : NaN
+        const price = pt['price']
+        if (typeof price !== 'number' || !Number.isFinite(price) || Number.isNaN(t)) {
+          validRaw = false
+          break
+        }
+        const note = typeof pt['note'] === 'string' ? pt['note'] : undefined
+        parsed.push(note !== undefined ? { time: pt['time'] as string, t, price, note } : { time: pt['time'] as string, t, price })
+      }
+      if (!validRaw) {
+        dropped += 1
+      } else if (!isCrossTf) {
+        // A path on the same timeframe is dropped WHOLE or not at all when out of bounds,
+        // and drawn exactly as authored: its projected (future) vertices are the claim,
+        // so they are never clipped to the last candle. klinecharts 10 extrapolates
+        // timestamps past the last bar from the chart period.
+        const ok = parsed.every(pt =>
+          inBand(pt.price, role, lo, hi, false) && pt.t >= firstMs && pt.t <= lastMs + forwardMs)
+        if (ok) {
+          kept.push(a)
+        } else {
+          dropped += 1
+        }
+      } else {
+        // Cross-timeframe: clip segments crossing firstMs so higher-timeframe
+        // trendlines stay visible on lower-timeframe views without moving future endpoints.
+        const clipped = clipPathToWindow(parsed, firstMs)
+        const ok = clipped.length >= 2 && clipped.every(pt => inBand(pt.price, role, lo, hi, true))
+        if (ok) kept.push({ ...a, points: clipped })
+        else dropped += 1
+      }
+    } else {
+      // The annotation array is an open envelope: an unknown type belongs to a
+      // renderer this build has never heard of, and stripping it would break
+      // that seam. Pass it through untouched.
+      kept.push(a)
+    }
+  }
+
+  const scenarios: ChartScenario[] = marks.scenarios.map(s => {
+    const rec = s as unknown as Record<string, unknown>
+    let next = s
+    for (const field of ['triggerPrice', 'invalidationPrice'] as const) {
+      const price = rec[field]
+      if (price !== undefined && !inBand(price, field === 'triggerPrice' ? 'target' : 'invalidation', lo, hi, isCrossTf)) {
+        // Keep the prose, lose only the price it cannot justify.
+        const { [field]: _drop, ...rest } = next as Record<string, unknown>
+        next = rest as unknown as ChartScenario
+        dropped += 1
+      }
+    }
+    return next
+  })
+
+  if (kept.length === 0 && scenarios.length === 0) {
+    return { payload, applied: true, kept: 0, dropped }
+  }
+  // Scenarios draw trigger/invalidation lines of their own, so they count as
+  // marks; reporting only annotations makes a scenario-only analysis claim
+  // "0 marks" while its lines sit on the canvas.
+  const drawn = kept.length + scenarios.length
+
+  return {
+    payload: {
+      ...payload,
+      timeframes: [{ ...tf, annotations: kept }, ...payload.timeframes.slice(1)],
+      ...scenarios.length > 0 ? { scenarios } : {},
+    },
+    applied: true,
+    kept: drawn,
+    dropped,
+  }
+}
+
+/** Unwrap an RPC result, turning the error branch into a thrown Error. */
+async function unwrap(promise: ReturnType<RpcCaller['call']>): Promise<unknown> {
+  const result = await promise
+  if (result.ok) return result.value
+  throw new Error(result.error.message)
+}
+
+/**
+ * Wrap raw candles as a chart payload. Indicators/series stay empty here on
+ * purpose: these bars came straight from the provider, so there is no
+ * *model-computed* regime to attribute to the agent. `ChartBody` fills them
+ * client-side via `enrichChartTimeframe` so live-panel chips (MACD/Stoch/…)
+ * still work without an agent snapshot.
+ * @param providerId - the provider that served the bars.
+ * @param symbol - the instrument.
+ * @param timeframe - the bar interval.
+ * @param candles - ascending candles.
+ * @returns a payload ChartBody can render.
+ */
+export function candlesToPayload(
+  providerId: string,
+  symbol: string,
+  timeframe: string,
+  candles: ChartPayload['timeframes'][number]['candles'],
+): ChartPayload {
+  return {
+    kind: 'chart',
+    version: 1,
+    provider: providerId,
+    symbol,
+    timeframes: [{ timeframe, candles, indicators: null, annotations: [] }],
+    scenarios: [],
+  }
+}
+
+/**
+ * Bind a market client to a live RPC caller.
+ * @param rpc - `ctx.connection.rpc`.
+ * @returns the panel's data client.
+ */
+export function createMarketClient(rpc: RpcCaller): MarketClient {
+  return {
+    async listProviders(signal) {
+      try {
+        const value = await unwrap(rpc.call(CHANNEL, 'providers', {}, signal)) as {
+          providers: { id: string; description: string; timeframes?: string[] }[]
+        }
+        return value.providers ?? []
+      } catch {
+        return []
+      }
+    },
+
+    async listSymbols(signal) {
+      const value = await unwrap(rpc.call(CHANNEL, 'symbols', {}, signal)) as {
+        providerId: string
+        description: string
+        symbols: PanelInstrument[]
+      }
+      return value
+    },
+
+    async search(query, signalOrOpts) {
+      const opts: { providerId?: string; signal?: AbortSignal } =
+        signalOrOpts instanceof AbortSignal ? { signal: signalOrOpts } : signalOrOpts ?? {}
+      const body = opts.providerId ? { query, providerId: opts.providerId } : { query }
+      const value = await unwrap(rpc.call(CHANNEL, 'search', body, opts.signal)) as { items: PanelInstrument[] }
+      return value.items
+    },
+
+    async getPayload(symbol, timeframe, providerId, signal) {
+      const body = providerId ? { symbol, timeframe, providerId } : { symbol, timeframe }
+      const value = await unwrap(rpc.call(CHANNEL, 'ohlcv', body, signal)) as {
+        providerId: string
+        symbol: string
+        timeframe: string
+        candles: ChartPayload['timeframes'][number]['candles']
+      }
+      if (value.candles.length === 0) {
+        throw new Error(`${symbol} @ ${timeframe}: the provider returned no bars for this window`)
+      }
+      return candlesToPayload(value.providerId, value.symbol, value.timeframe, value.candles)
+    },
+
+    publishView(view) {
+      void rpc.call(CHANNEL, 'view', view).catch(() => { /* presentation only */ })
+    },
+
+    async getTail(symbol, timeframe, bars, providerId, signal) {
+      const body = providerId ? { symbol, timeframe, limit: bars, providerId } : { symbol, timeframe, limit: bars }
+      const value = await unwrap(rpc.call(CHANNEL, 'ohlcv', body, signal)) as {
+        candles: Candle[]
+      }
+      return value.candles
+    },
+
+    async getBefore(symbol, timeframe, beforeMs, bars, providerId, signal) {
+      const body: Record<string, unknown> = { symbol, timeframe, limit: bars, end: beforeMs - 1 }
+      if (providerId) body['providerId'] = providerId
+      const value = await unwrap(rpc.call(CHANNEL, 'ohlcv', body, signal)) as { candles: Candle[] }
+      return olderThan(value.candles ?? [], beforeMs)
+    },
+
+    async getDerivatives(symbol, providerId, signal) {
+      const body = providerId === undefined ? { symbol } : { symbol, providerId }
+      const value = await unwrap(rpc.call(CHANNEL, 'derivatives', body, signal)) as {
+        derivatives: PanelDerivatives | null
+      }
+      return value.derivatives
+    },
+
+    async getCvd(symbol, timeframe, limit, providerId, signal) {
+      const body: Record<string, unknown> = { symbol, timeframe, limit }
+      if (providerId !== undefined) body['providerId'] = providerId
+      const value = await unwrap(rpc.call(CHANNEL, 'cvd', body, signal)) as { bars: PanelCvdBar[] | null }
+      return value.bars
+    },
+
+    async getMoneyFlow(symbol, providerId, signal) {
+      const body = providerId === undefined ? { symbol } : { symbol, providerId }
+      const value = await unwrap(rpc.call(CHANNEL, 'moneyflow', body, signal)) as {
+        moneyFlow: PanelMoneyFlow | null
+      }
+      return value.moneyFlow
+    },
+
+    async getOrderbook(symbol, providerId, signal) {
+      const body = providerId === undefined ? { symbol } : { symbol, providerId }
+      const value = await unwrap(rpc.call(CHANNEL, 'orderbook', body, signal)) as {
+        orderbook: Orderbook | null
+      }
+      return value.orderbook
+    },
+
+    async getLargeOrders(symbol, opts, signal) {
+      const body: Record<string, unknown> = { symbol }
+      if (opts?.hours !== undefined) body['hours'] = opts.hours
+      if (opts?.top !== undefined) body['top'] = opts.top
+      if (opts?.venue !== undefined) body['venue'] = opts.venue
+      if (opts?.marketType !== undefined) body['marketType'] = opts.marketType
+      if (opts?.minUsd !== undefined) body['minUsd'] = opts.minUsd
+      if (opts?.currentPrice !== undefined) body['currentPrice'] = opts.currentPrice
+      if (opts?.maxDistancePct !== undefined) body['maxDistancePct'] = opts.maxDistancePct
+      if (opts?.status !== undefined) body['status'] = opts.status
+      if (opts?.balanced !== undefined) body['balanced'] = opts.balanced
+      if (opts?.tradesMinUsd !== undefined) body['tradesMinUsd'] = opts.tradesMinUsd
+      if (opts?.spotMinUsd !== undefined) body['spotMinUsd'] = opts.spotMinUsd
+      if (opts?.spotTradesMinUsd !== undefined) body['spotTradesMinUsd'] = opts.spotTradesMinUsd
+      const value = await unwrap(rpc.call(CHANNEL, 'largeOrders', body, signal)) as PanelLargeOrders
+      return value
+    },
+
+    async getFundamentals(symbol, providerId, signal) {
+      const body = providerId === undefined ? { symbol } : { symbol, providerId }
+      const value = await unwrap(rpc.call(CHANNEL, 'fundamentals', body, signal)) as {
+        fundamentals: FundamentalsPackage | null
+      }
+      return value.fundamentals
+    },
+
+    async getWatchlist(signal) {
+      const value = await unwrap(rpc.call(CHANNEL, 'watchlist', {}, signal)) as {
+        items: { symbol: string; group: string; notes?: string }[]
+        groups: string[]
+      }
+      return value
+    },
+
+    async addToWatchlist(symbol, group, notes) {
+      const value = await unwrap(rpc.call(CHANNEL, 'watchlistAdd', { symbol, group, notes })) as {
+        ok: boolean
+        symbol: string
+      }
+      return value
+    },
+
+    async removeFromWatchlist(symbol) {
+      const value = await unwrap(rpc.call(CHANNEL, 'watchlistRemove', { symbol })) as {
+        ok: boolean
+        symbol: string
+      }
+      return value
+    },
+  }
+}
+
+/** Where a tab remembers the marks it was last showing. */
+const MARKS_KEY = 'dsh-trading:chart-marks'
+
+/**
+ * Remember the agent's marks for this tab.
+ *
+ * `latest` holds one payload and only a card that RENDERS publishes it, so
+ * after a reload the marks depend on which cards the conversation happened to
+ * have in view — an annotated chart drawn twenty messages ago is virtualised
+ * away and its drawing silently does not come back. Session storage is the
+ * right scope: per tab, and gone when the tab closes, so nothing resurfaces a
+ * day later claiming to be current.
+ *
+ * Failures are swallowed. Storage can be full or blocked by policy, and a
+ * chart that draws without its marks is a far better outcome than one that
+ * does not draw at all.
+ *
+ * @param marks - the marks to remember, or null to forget them.
+ */
+export function rememberMarks(marks: ChartMarks | null): void {
+  try {
+    if (marks === null) sessionStorage.removeItem(MARKS_KEY)
+    else sessionStorage.setItem(MARKS_KEY, JSON.stringify(marks))
+  } catch { /* storage is a convenience, never a requirement */ }
+}
+
+/**
+ * Read back the marks this tab was last showing.
+ * @returns the remembered marks, or null when there are none or they are unreadable.
+ */
+export function recallMarks(): ChartMarks | null {
+  try {
+    const raw = sessionStorage.getItem(MARKS_KEY)
+    if (raw === null) return null
+    const parsed = JSON.parse(raw) as ChartMarks
+    // Validate the shape rather than trusting storage: this feeds the merge
+    // predicate and, through it, what gets drawn on a chart.
+    if (typeof parsed?.key !== 'string' || typeof parsed?.symbol !== 'string') return null
+    if (typeof parsed.rawSymbol !== 'string' || typeof parsed.timeframe !== 'string') return null
+    if (!Array.isArray(parsed.annotations) || !Array.isArray(parsed.scenarios)) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Consistent styling for price × OI posture labels across ChartPanel and ChartCard.
+ * Green = net long buying; Red = net short selling;
+ * Orange = position reduction (long liquidation or short covering) or neutral.
+ */
+/**
+ * Contract OI for the posture line. USD value moves with price, so a spike can
+ * print a rising line while contracts fall — the opposite of 价涨减仓.
+ * Missing contracts stay missing; do not substitute openInterestValue.
+ */
+export function contractOpenInterest(bar: { openInterest?: number | null }): number | null {
+  const n = bar.openInterest
+  return n === null || n === undefined || !Number.isFinite(n) ? null : n
+}
+
+export function postureColor(posture: string | null | undefined): { color: string; bg: string } {
+  if (!posture || posture === '—' || posture.includes('持平') || posture.includes('观望')) {
+    return { color: '#8b949e', bg: 'rgba(139,148,158,0.12)' }
+  }
+  if (posture.includes('爆仓') || posture.includes('清算') || posture.includes('踩踏') || posture.includes('轧空')) {
+    return { color: '#d2a8ff', bg: 'rgba(210,168,255,0.18)' }
+  }
+  if (posture.includes('吸筹') || posture.includes('接盘')) {
+    return { color: '#27C6DA', bg: 'rgba(39,198,218,0.18)' }
+  }
+  if (posture.includes('强多头') || posture.includes('多头增仓') || posture.includes('价涨增仓') || posture.includes('做多')) {
+    return { color: '#3ddc97', bg: 'rgba(61,220,151,0.15)' }
+  }
+  if (posture.includes('强空头') || posture.includes('空头增仓') || posture.includes('价跌增仓') || posture.includes('做空')) {
+    return { color: '#f47067', bg: 'rgba(244,112,103,0.15)' }
+  }
+  return { color: '#ffa726', bg: 'rgba(255,167,38,0.15)' }
+}

@@ -1,8 +1,8 @@
 # 交易模式 (Trading Mode) Agent Preset
-# Persona source mirrored into @dsh-trading/bundle (cordis.patch.yml →
+# Persona source mirrored into dsh-trading (cordis.patch.yml →
 # @deepseek-ai/dsh-agent-preset id: trading). Official dsh-persona fields are
 # `prefix` / `suffix` (not `text`). $DSH_HOME/.agent-presets/ is legacy — dsh
-# no longer reads that directory; install is via the trading bundle patch.
+# no longer reads that directory; install is via the dsh-trading plugin.
 
 - id: trading-persona
   name: '@deepseek-ai/dsh-persona'
@@ -89,5 +89,5 @@
     suffix: |
       回答像跟熟人说话：少套话、少列表堆砌，除非对方要明细。
 
-# Tools stay on the profile bundle (@dsh-trading/bundle). Do not remount
-# @dsh-trading/tool-market here — that would double-register.
+# Tools stay on the main dsh-trading plugin. Do not remount tool-market
+# here — that would double-register.

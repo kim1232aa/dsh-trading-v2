@@ -1,0 +1,375 @@
+/**
+ * One timeframe's indicator regime: the latest value of each dashboard
+ * indicator plus a coarse label the model can reason over without re-deriving
+ * thresholds. Labels use the conventional bands (RSI 30/70, Stoch 20/80,
+ * ADX 20/25, MFI 20/80) — coarse on purpose; nuance belongs to the analyst,
+ * not the tool.
+ *
+ * Every label is derived from the ROUNDED value the snapshot reports, never
+ * from the full-precision one behind it, so a label can never contradict the
+ * number printed beside it.
+ * @module @dsh-trading/tool-market
+ */
+
+import type { Candle, Derivatives } from '../market-data/index.js'
+import { formatUsdtCn, formatPctCn } from '../market-data/index.js'
+import { rsi, sma, wma } from './indicators.js'
+import { adx, atr, bollinger, ema, macd, mfi, stochastic, supertrend } from './candle-indicators.js'
+import { renderSignal, signalReport } from './signal.js'
+import type { SignalReport } from './signal.js'
+import { priceStructure, renderStructure } from './structure.js'
+import type { Structure } from './structure.js'
+import { renderRsiGrid, rsiGridReport, RSI_GRID_DEFAULTS, RSI_GRID_SHORT_DEFAULTS } from './rsi-grid.js'
+import type { RsiGridReport } from './rsi-grid.js'
+import { revPointReport, renderRevPoint } from './revpoint.js'
+import type { RevPointReport } from './revpoint.js'
+import { renderRsiDiff, rsiDiffReport } from './rsi-diff.js'
+import type { RsiDiffReport } from './rsi-diff.js'
+
+/** Latest defined value of a series, or null when nothing seeded. */
+function last<T>(series: readonly (T | null)[]): T | null {
+  for (let i = series.length - 1; i >= 0; i--) {
+    if (series[i] !== null && series[i] !== undefined) return series[i]!
+  }
+  return null
+}
+
+/**
+ * Round for reporting. `-0` collapses to `0`: a residue that rounds away to
+ * nothing must not keep a sign none of the reported digits can show.
+ */
+const round = (v: number | null, places = 2): number | null => {
+  if (v === null) return null
+  const rounded = Number(v.toFixed(places))
+  return rounded === 0 ? 0 : rounded
+}
+
+function band(value: number | null, low: number, high: number, labels: [string, string, string]): string | null {
+  if (value === null) return null
+  return value < low ? labels[0] : value > high ? labels[2] : labels[1]
+}
+
+/**
+ * Which side of its signal the macd line sits on, decided on the same rounded
+ * numbers the snapshot reports. A series whose line converges onto its signal
+ * (a linear ramp pins the line to a constant the signal EMA reproduces exactly)
+ * is equal in real arithmetic and differs only by float residue: that ties at
+ * reporting precision and reads 'flat', rather than taking a side from ~1e-15
+ * no one can see. 'converging' marks a histogram inside 5% of the line; a flat
+ * reading has already arrived, so it carries no tag.
+ */
+function macdState(line: number, signal: number, histogram: number | null): string {
+  if (line === signal) return 'flat'
+  const side = line > signal ? 'bullish' : 'bearish'
+  return histogram !== null && Math.abs(histogram) < Math.abs(line) * 0.05
+    ? `${side}, converging`
+    : side
+}
+
+export type RegimeDerivatives = {
+  source: string
+  openInterest: number | null
+  openInterestValue: number | null
+  oiUnit?: 'base'
+  fundingRate: number | null
+  fundingRateAnnualizedPct?: number | null
+  fundingLabel?: string | null
+  nextFundingTime: string | null
+  /** Global account-count long/short (>1 = more long accounts). */
+  longShortRatio: number | null
+  longShortRatioKind?: 'global_accounts' | 'top_accounts' | 'top_positions' | 'unknown'
+  topPositionRatio?: number | null
+  topAccountRatio?: number | null
+  takerBuySellRatio: number | null
+  cvd1h?: number | null
+  cvdNote?: string | null
+  basisPct?: number | null
+  time: string
+  /** % Δ of base-unit OI (not USDT notional). */
+  oiChangePct1h?: number | null
+  oiChangePct4h?: number | null
+  oiChangePct24h?: number | null
+  netPositionDelta1h?: number | null
+  topLongDelta1h?: number | null
+  topShortDelta1h?: number | null
+  priceChangePct1h?: number | null
+  priceChangePct4h?: number | null
+  priceChangePct24h?: number | null
+  posture?: string | null
+  crowdVsWhale?: string | null
+  liquidationLongUsd1h?: number | null
+  liquidationShortUsd1h?: number | null
+  liquidationSummary?: string | null
+  liquidationSource?: string | null
+}
+
+export type RegimeMoneyFlow = {
+  symbol: string
+  time?: string
+  netInflow: number
+  superLargeInflow?: number | null
+  largeInflow?: number | null
+  mediumInflow?: number | null
+  smallInflow?: number | null
+  mainRatioPct?: number | null
+  summary?: string
+}
+
+export type RegimeFundamentals = {
+  symbol: string
+  time?: string
+  peTtm?: number | null
+  pb?: number | null
+  marketCap?: number | null
+  circulatingMarketCap?: number | null
+  turnoverRatio?: number | null
+}
+
+/**
+ * The per-timeframe regime snapshot the tool returns and renders. A type
+ * alias rather than an interface so it stays structurally assignable to the
+ * harness's `JsonValue` (interfaces get no implicit index signature), which
+ * is what lets the tool return it through a `type: 'json'` output node.
+ */
+export type RegimeSnapshot = {
+  bars: number
+  lastTime: string
+  close: number
+  /** Percent change of the last close vs the previous close. */
+  changePct: number | null
+  rsi14: { value: number | null; state: string | null }
+  stochastic: { k: number | null; d: number | null; state: string | null }
+  adx14: { value: number | null; plusDi: number | null; minusDi: number | null; state: string | null }
+  /** `state` reads `line` against `signal`: bullish, bearish, or flat when they tie. */
+  macd: { line: number | null; signal: number | null; histogram: number | null; state: string | null }
+  mfi14: { value: number | null; state: string | null }
+  atr14: { value: number | null; pctOfClose: number | null }
+  movingAverages: {
+    sma20: number | null
+    sma50: number | null
+    sma200: number | null
+    ema20: number | null
+    /** Which of the seeded SMAs the close sits above, e.g. `above 20/50, below 200`. */
+    closeVs: string
+  }
+  wma: {
+    wma60: number | null
+    wma100: number | null
+    wma200: number | null
+    closeVs: string
+  }
+  supertrend: {
+    value: number | null
+    direction: 'bullish' | 'bearish' | null
+    state: string | null
+  }
+  bollinger20: { upper: number | null; middle: number | null; lower: number | null; state: string | null }
+  derivatives?: RegimeDerivatives | null
+  signal: SignalReport
+  structure: Structure
+  rsiGrid: RsiGridReport
+  /** Mirrored short extension (not in the long-only Pine source); enabled unless explicitly disabled. */
+  rsiGridShort?: RsiGridReport
+  revPoint: RevPointReport
+  rsiDiff: RsiDiffReport
+  moneyFlow?: RegimeMoneyFlow | null
+  fundamentals?: RegimeFundamentals | null
+}
+
+/** Base-coin OI history from the provider (5m stats), for RevPoint's OI1h star. */
+function oiPoints(d: RegimeDerivatives | null | undefined): { t: number; oi: number }[] {
+  const h = (d as { history?: { time: string; openInterest: number | null }[] } | null | undefined)?.history
+  if (!Array.isArray(h)) return []
+  return h.flatMap(b => (typeof b.openInterest === 'number' ? [{ t: Date.parse(b.time), oi: b.openInterest }] : []))
+}
+
+/** Compute the full dashboard for one candle series (ascending, as providers serve it). */
+export function regimeSnapshot(
+  candles: readonly Candle[],
+  derivatives?: RegimeDerivatives | null,
+  moneyFlow?: RegimeMoneyFlow | null,
+  fundamentals?: RegimeFundamentals | null,
+  opts: { rsiGridShort?: boolean } = {},
+): RegimeSnapshot {
+  if (candles.length === 0) throw new Error('regimeSnapshot requires at least one candle')
+  const closes = candles.map(c => c.close)
+  const latest = candles[candles.length - 1]!
+  const prev = candles.length > 1 ? candles[candles.length - 2]!.close : null
+
+  // Rounded once, here: every value below is both what the snapshot reports and
+  // what its label is computed from, so the two cannot drift apart.
+  const rsiV = round(last(rsi(closes, 14)))
+  const { k, d } = stochastic(candles)
+  const kV = round(last(k))
+  const dV = round(last(d))
+  const adxR = adx(candles)
+  const adxV = round(last(adxR.adx))
+  const macdR = macd(closes)
+  const macdLine = round(last(macdR.macd), 4)
+  const macdSig = round(last(macdR.signal), 4)
+  const macdHist = round(last(macdR.histogram), 4)
+  const mfiV = round(last(mfi(candles)))
+  const atrV = round(last(atr(candles)), 4)
+  const bb = bollinger(closes)
+  const bbU = round(last(bb.upper), 4)
+  const bbL = round(last(bb.lower), 4)
+
+  const smas: [number, number | null][] = [20, 50, 200].map(w =>
+    [w, candles.length >= w ? round(last(sma(closes, w)), 4) : null] as [number, number | null])
+  const above = smas.filter(([, v]) => v !== null && latest.close >= v).map(([w]) => w)
+  const below = smas.filter(([, v]) => v !== null && latest.close < v).map(([w]) => w)
+  const closeVs = [
+    above.length > 0 ? `above ${above.join('/')}` : null,
+    below.length > 0 ? `below ${below.join('/')}` : null,
+  ].filter(Boolean).join(', ') || 'no seeded moving averages'
+
+  const wmas: [number, number | null][] = [60, 100, 200].map(w =>
+    [w, candles.length >= w ? round(last(wma(closes, w)), 4) : null] as [number, number | null])
+  const wmaAbove = wmas.filter(([, v]) => v !== null && latest.close >= v).map(([w]) => w)
+  const wmaBelow = wmas.filter(([, v]) => v !== null && latest.close < v).map(([w]) => w)
+  const wmaCloseVs = [
+    wmaAbove.length > 0 ? `above ${wmaAbove.join('/')}` : null,
+    wmaBelow.length > 0 ? `below ${wmaBelow.join('/')}` : null,
+  ].filter(Boolean).join(', ') || 'no seeded wma'
+
+  const st = supertrend(candles, 60, 4)
+  const stVal = round(last(st.values), 2)
+  const stDir = last(st.direction)
+  const stState = stVal === null || stDir === null ? null
+    : `${stDir} (${stDir === 'bullish' ? 'support' : 'resistance'} at ${stVal})`
+
+  return {
+    bars: candles.length,
+    lastTime: latest.time,
+    close: latest.close,
+    changePct: prev === null || prev === 0 ? null : round(((latest.close - prev) / prev) * 100),
+    rsi14: { value: rsiV, state: band(rsiV, 30, 70, ['oversold', 'neutral', 'overbought']) },
+    stochastic: {
+      k: kV,
+      d: dV,
+      state: band(kV, 20, 80, ['oversold', 'neutral', 'overbought']),
+    },
+    adx14: {
+      value: adxV,
+      plusDi: round(last(adxR.plusDi)),
+      minusDi: round(last(adxR.minusDi)),
+      state: band(adxV, 20, 25, ['no trend', 'developing trend', 'trending']),
+    },
+    macd: {
+      line: macdLine,
+      signal: macdSig,
+      histogram: macdHist,
+      state: macdLine === null || macdSig === null
+        ? null
+        : macdState(macdLine, macdSig, macdHist),
+    },
+    mfi14: { value: mfiV, state: band(mfiV, 20, 80, ['oversold', 'neutral', 'overbought']) },
+    atr14: {
+      value: atrV,
+      pctOfClose: atrV === null || latest.close === 0 ? null : round((atrV / latest.close) * 100),
+    },
+    movingAverages: {
+      sma20: smas[0]![1],
+      sma50: smas[1]![1],
+      sma200: smas[2]![1],
+      ema20: round(last(ema(closes, 20)), 4),
+      closeVs,
+    },
+    wma: {
+      wma60: wmas[0]![1],
+      wma100: wmas[1]![1],
+      wma200: wmas[2]![1],
+      closeVs: wmaCloseVs,
+    },
+    supertrend: {
+      value: stVal,
+      direction: stDir,
+      state: stState,
+    },
+    bollinger20: {
+      upper: bbU,
+      middle: round(last(bb.middle), 4),
+      lower: bbL,
+      state: bbU === null || bbL === null
+        ? null
+        : latest.close > bbU ? 'above upper band' : latest.close < bbL ? 'below lower band' : 'inside bands',
+    },
+    derivatives: derivatives ?? null,
+    moneyFlow: moneyFlow ?? null,
+    fundamentals: fundamentals ?? null,
+    signal: signalReport(candles),
+    structure: priceStructure(candles),
+    rsiGrid: rsiGridReport(candles),
+    ...(opts.rsiGridShort !== false ? { rsiGridShort: rsiGridReport(candles, RSI_GRID_SHORT_DEFAULTS, 'short') } : {}),
+    revPoint: revPointReport(candles, oiPoints(derivatives)),
+    rsiDiff: rsiDiffReport(closes, 6, 12),
+  }
+}
+
+/** Render one timeframe's snapshot as the compact text block the model reads. */
+export function renderSnapshot(timeframe: string, s: RegimeSnapshot): string {
+  const fmt = (v: number | null): string => {
+    if (v === null) return '–'
+    if (!Number.isFinite(v)) return '–'
+    const a = Math.abs(v)
+    // 币数上千取整；比值/小数统一两位，避免 0.9006 这类长尾。
+    if (a >= 1000) return String(Number(v.toFixed(0)))
+    return String(Number(v.toFixed(2)))
+  }
+  const lines = [
+    `[${timeframe}] ${s.bars} bars, last ${s.lastTime}, close ${s.close}${s.changePct !== null ? ` (${s.changePct > 0 ? '+' : ''}${s.changePct}%)` : ''}`,
+    `  RSI14 ${fmt(s.rsi14.value)} (${s.rsi14.state ?? '–'}) | Stoch %K ${fmt(s.stochastic.k)} %D ${fmt(s.stochastic.d)} (${s.stochastic.state ?? '–'}) | ADX ${fmt(s.adx14.value)} +DI ${fmt(s.adx14.plusDi)} −DI ${fmt(s.adx14.minusDi)} (${s.adx14.state ?? '–'})`,
+    `  MACD ${fmt(s.macd.line)} sig ${fmt(s.macd.signal)} hist ${fmt(s.macd.histogram)} (${s.macd.state ?? '–'}) | MFI ${fmt(s.mfi14.value)} (${s.mfi14.state ?? '–'}) | ATR ${fmt(s.atr14.value)}${s.atr14.pctOfClose !== null ? ` = ${s.atr14.pctOfClose}% of close` : ''}`,
+    `  close ${s.movingAverages.closeVs} | SMA20 ${fmt(s.movingAverages.sma20)} SMA50 ${fmt(s.movingAverages.sma50)} SMA200 ${fmt(s.movingAverages.sma200)} EMA20 ${fmt(s.movingAverages.ema20)} | BB(20,2) ${s.bollinger20.state ?? '–'} [${fmt(s.bollinger20.lower)} … ${fmt(s.bollinger20.upper)}]`,
+    `  WMA(60,100,200) ${s.wma.closeVs} [${fmt(s.wma.wma60)} / ${fmt(s.wma.wma100)} / ${fmt(s.wma.wma200)}] | SuperTrend(60,4) ${s.supertrend.state ?? '–'}`,
+  ]
+  lines.push(renderStructure(s.structure))
+  lines.push(renderSignal(s.signal))
+  lines.push(renderRsiGrid(s.rsiGrid, s.rsiGridShort))
+  lines.push(renderRevPoint(s.revPoint))
+  lines.push(renderRsiDiff(s.rsiDiff))
+  if (s.derivatives) {
+    const d = s.derivatives
+    const oiUsdt = d.openInterestValue !== null ? `OI名义 ${formatUsdtCn(d.openInterestValue)}` : 'OI名义 –'
+    const oiBase = d.openInterest !== null ? `币数 ${fmt(d.openInterest)}` : null
+    const fr = d.fundingRate !== null ? `${(d.fundingRate * 100).toFixed(4)}%/8h` : '–'
+    const apr = d.fundingRateAnnualizedPct != null ? `年化${d.fundingRateAnnualizedPct}%` : ''
+    const frLabel = d.fundingLabel ? ` ${d.fundingLabel}` : ''
+    const ratioBits: string[] = []
+    if (d.longShortRatio !== null) {
+      ratioBits.push(`账户人数比 ${fmt(d.longShortRatio)}(>1净多)`)
+    }
+    if (d.topPositionRatio != null) ratioBits.push(`大户持仓比 ${fmt(d.topPositionRatio)}`)
+    if (d.topAccountRatio != null) ratioBits.push(`大户账户比 ${fmt(d.topAccountRatio)}`)
+    // OKX only has top positions — do not print empty 账户人数比 –
+    if (ratioBits.length === 0 && d.longShortRatioKind === 'top_positions') {
+      ratioBits.push('大户持仓比 –')
+    }
+    const oiHoriz = [
+      d.oiChangePct1h != null ? `1h仓 ${formatPctCn(d.oiChangePct1h)} 价 ${d.priceChangePct1h != null ? formatPctCn(d.priceChangePct1h) : '–'}` : null,
+      d.oiChangePct4h != null ? `4h仓 ${formatPctCn(d.oiChangePct4h)}` : null,
+      d.oiChangePct24h != null ? `24h仓 ${formatPctCn(d.oiChangePct24h)}` : null,
+    ].filter(Boolean).join(' · ')
+    const posture = d.posture ? ` → ${d.posture}` : ''
+    const cvd = d.cvd1h != null ? ` | CVD1h ${d.cvd1h > 0 ? '+' : ''}${Number(d.cvd1h.toFixed(2))}币${d.cvdNote ? `(${d.cvdNote})` : ''}` : ''
+    const netPos = d.netPositionDelta1h != null
+      ? ` | 净头寸1h ${d.netPositionDelta1h > 0 ? '+' : ''}${Math.round(d.netPositionDelta1h)}币(多${d.topLongDelta1h != null && d.topLongDelta1h > 0 ? '+' : ''}${Math.round(d.topLongDelta1h ?? 0)}/空${d.topShortDelta1h != null && d.topShortDelta1h > 0 ? '+' : ''}${Math.round(d.topShortDelta1h ?? 0)})`
+      : ''
+    const basis = d.basisPct != null ? ` | 基差 ${formatPctCn(d.basisPct, 3)}` : ''
+    const liq = d.liquidationSummary ? ` | ${d.liquidationSummary}` : ''
+    const crowd = d.crowdVsWhale ? ` | ${d.crowdVsWhale}` : ''
+    const taker = d.takerBuySellRatio !== null ? `主动买卖 ${fmt(d.takerBuySellRatio)}` : '主动买卖 –'
+    const head = [oiUsdt, oiBase].filter(Boolean).join(' · ')
+    lines.push(`  合约(${d.source}): ${head} | 费率 ${fr}${apr ? ` ${apr}` : ''}${frLabel} | ${ratioBits.join(' · ') || '多空比 –'} | ${taker}${oiHoriz ? ` | ${oiHoriz}${posture}` : ''}${cvd}${netPos}${basis}${crowd}${liq}`)
+  }
+  if (s.moneyFlow?.summary) {
+    lines.push(`  资金流向: ${s.moneyFlow.summary}`)
+  }
+  if (s.fundamentals) {
+    const f = s.fundamentals
+    const yi = (v: number | null | undefined): string =>
+      v == null ? '–' : v >= 1e8 ? `${(v / 1e8).toFixed(2)}亿` : String(v)
+    lines.push(`  基本面: PE(TTM) ${fmt(f.peTtm ?? null)} | PB ${fmt(f.pb ?? null)} | 总市值 ${yi(f.marketCap)} | 流通市值 ${yi(f.circulatingMarketCap)}${f.turnoverRatio != null ? ` | 换手 ${f.turnoverRatio}%` : ''}`)
+  }
+  return lines.join('\n')
+}

@@ -1,5 +1,5 @@
 # The Market Analyst preset: the analysis persona as one per-session composition.
-# Shipped via @dsh-trading/bundle (cordis.patch.yml → @deepseek-ai/dsh-agent-preset
+# Shipped via dsh-trading (cordis.patch.yml → @deepseek-ai/dsh-agent-preset
 # id: analyst). Official dsh-persona field is `prefix` / `suffix` (not `text`).
 # $DSH_HOME/.agent-presets/ is legacy and no longer read by dsh.
 
@@ -115,4 +115,4 @@
       instructions to trade. If asked to trade or to advise, explain that this
       is a research tool and that trading and advice are out of its scope.
 
-# Tools stay on the profile bundle. Do not remount @dsh-trading/tool-market here.
+# Tools stay on the main dsh-trading plugin. Do not remount tools here.

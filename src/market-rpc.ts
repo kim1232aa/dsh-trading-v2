@@ -1,0 +1,570 @@
+/**
+ * The host half's data channel for the chart column.
+ *
+ * Why this exists: the persistent chart panel must be drivable BY THE USER, not
+ * only by the model. Routing the panel's own symbol lookups through a tool call
+ * would make the workbench hostage to whether the agent decides to call one —
+ * which, in practice, it often does not. So the panel talks to `ctx.marketData`
+ * over a loopback RPC channel, and the model's `market_snapshot` /
+ * `annotate_chart` results keep arriving through the tool-view seam. Two
+ * independent paths onto one chart.
+ *
+ * The two data verbs are exactly `MarketDataProvider`'s, and nothing else. The
+ * third endpoint (`view`) writes only what the panel is CURRENTLY SHOWING —
+ * a symbol, a timeframe, a bar count — so the agent can stop asking the user
+ * for a screenshot of a chart it is sitting right next to. None of this
+ * reaches the tool layer, so risk-guard's execution gate is neither weakened
+ * nor bypassed: there is no execution-shaped verb here to gate.
+ * @module
+ */
+
+import type {
+  Candle,
+  CvdBar,
+  Derivatives,
+  FundamentalsPackage,
+  InstrumentInfo,
+  MarketDataProvider,
+  MoneyFlow,
+  Orderbook,
+  Timeframe,
+} from './market-data/index.js'
+
+/**
+ * Logical channel this package owns on the Connection transport.
+ *
+ * ONE path segment, by contract: the client validates channels against
+ * `/^\/[A-Za-z0-9._~-]+$/`, so a namespaced `/dsh-trading/market` is rejected
+ * before it ever reaches the wire. The hyphen carries the namespace instead.
+ */
+export const MARKET_CHANNEL = '/dsh-trading-market'
+
+/** Channel-relative endpoints. */
+export const ENDPOINTS = {
+  symbols: 'symbols',
+  ohlcv: 'ohlcv',
+  view: 'view',
+  derivatives: 'derivatives',
+  moneyflow: 'moneyflow',
+  providers: 'providers',
+  orderbook: 'orderbook',
+  fundamentals: 'fundamentals',
+  watchlist: 'watchlist',
+  watchlistAdd: 'watchlistAdd',
+  watchlistRemove: 'watchlistRemove',
+  largeOrders: 'largeOrders',
+  cvd: 'cvd',
+  search: 'search',
+} as const
+
+/** The `providers` answer: list of registered providers and their descriptions. */
+export interface ProvidersResponse {
+  /** `timeframes`: union of what the provider advertises via listSymbols (omitted when unknown). */
+  providers: { id: string; description: string; timeframes?: string[] }[]
+}
+
+/** The `derivatives` answer: null when the provider has no futures data at all (spot/equity/CSV). */
+export interface DerivativesResponse {
+  providerId: string
+  symbol: string
+  derivatives: Derivatives | null
+}
+
+/** The `cvd` answer: perp/spot taker delta per bar; null when the provider has none. */
+export interface CvdResponse {
+  providerId: string
+  symbol: string
+  timeframe: string
+  bars: CvdBar[] | null
+}
+
+/** The `moneyflow` answer: null when the provider has no capital flow data (e.g. crypto spot without order flow). */
+export interface MoneyFlowResponse {
+  providerId: string
+  symbol: string
+  moneyFlow: MoneyFlow | null
+}
+
+/** The `orderbook` answer: null when the provider has no L2 depth quotes. */
+export interface OrderbookResponse {
+  providerId: string
+  symbol: string
+  orderbook: Orderbook | null
+}
+
+/** The `largeOrders` answer: CoinGlass large resting walls (null when disabled / failed). */
+export interface LargeOrdersResponse {
+  symbol: string
+  cgSymbol: string
+  pair: string
+  orderCount: number
+  updatedAt?: number
+  /** Served from the last good pull because CoinGlass refused a fresh one. */
+  stale?: boolean
+  /** Venue queries that failed this round. */
+  failedSources?: number
+  walls: {
+    id: string | number
+    exchange: string
+    side: 'buy' | 'sell'
+    price: number
+    currentUsd: number
+    startUsd: number
+    startTime: number
+    currentTime: number
+    state: number
+  }[]
+  /** Executed large trades (oldest first), when requested via tradesMinUsd. */
+  trades?: {
+    id: string | number
+    exchange: string
+    market: 'spot' | 'perp'
+    side: 'buy' | 'sell'
+    price: number
+    usd: number
+    amount: number
+    time: number
+  }[]
+}
+
+/** The `fundamentals` answer: null when the provider has no financial valuation data. */
+export interface FundamentalsResponse {
+  providerId: string
+  symbol: string
+  fundamentals: FundamentalsPackage | null
+}
+
+/** The `watchlist` answer: items and user categories stored in @dsh-trading/watchlist. */
+export interface WatchlistResponse {
+  items: { symbol: string; group: string; notes?: string }[]
+  groups: string[]
+}
+
+/** Bars a single panel request may pull; a chart cannot show more than this usefully. */
+export const MAX_PANEL_BARS = 1000
+
+const TIMEFRAMES: ReadonlySet<string> = new Set([
+  '1m', '3m', '5m', '15m', '30m',
+  '1h', '2h', '4h', '6h', '8h', '12h',
+  '1d', '3d', '1w', '1M',
+])
+
+/** A validated `ohlcv` request. */
+export interface OhlcvRequest {
+  symbol: string
+  timeframe: Timeframe
+  limit: number
+  providerId?: string | undefined
+  /** Inclusive upper bound (bar open time, ISO) for history paging; omit for latest. */
+  end?: string | undefined
+}
+
+/**
+ * Validate an `ohlcv` payload arriving from the browser. Returns a typed
+ * request or an error string — the channel must not hand unchecked strings to
+ * a provider that may turn them into filesystem paths or wire codes.
+ * @param payload - the decoded request body.
+ * @returns the validated request, or a message naming what was wrong.
+ */
+export function readOhlcvRequest(payload: unknown): OhlcvRequest | string {
+  if (typeof payload !== 'object' || payload === null) return 'request must be an object'
+  const body = payload as Record<string, unknown>
+
+  const symbol = body['symbol']
+  if (typeof symbol !== 'string' || symbol.trim() === '') return 'symbol must be a non-empty string'
+  if (symbol.length > 64) return 'symbol is implausibly long'
+
+  const timeframe = body['timeframe']
+  if (typeof timeframe !== 'string' || !TIMEFRAMES.has(timeframe)) {
+    return `timeframe must be one of ${[...TIMEFRAMES].join(', ')}`
+  }
+
+  const rawLimit = body['limit']
+  const limit = rawLimit === undefined
+    ? MAX_PANEL_BARS
+    : typeof rawLimit === 'number' && Number.isFinite(rawLimit)
+      ? Math.min(MAX_PANEL_BARS, Math.max(1, Math.trunc(rawLimit)))
+      : NaN
+  if (Number.isNaN(limit)) return 'limit must be a number'
+
+  const providerId = body['providerId']
+  if (providerId !== undefined && typeof providerId !== 'string') return 'providerId must be a string'
+
+  const rawEnd = body['end']
+  let end: string | undefined
+  if (rawEnd !== undefined) {
+    const ms = typeof rawEnd === 'number' ? rawEnd : typeof rawEnd === 'string' ? Date.parse(rawEnd) : NaN
+    if (!Number.isFinite(ms) || ms <= 0) return 'end must be a timestamp'
+    end = new Date(ms).toISOString()
+  }
+
+  return end === undefined
+    ? { symbol: symbol.trim(), timeframe: timeframe as Timeframe, limit, providerId }
+    : { symbol: symbol.trim(), timeframe: timeframe as Timeframe, limit, providerId, end }
+}
+
+/** The panel's view of one instrument. */
+export interface SymbolsResponse {
+  providerId: string
+  description: string
+  symbols: InstrumentInfo[]
+}
+
+/** What a name lookup resolved to; every hit names the feed that serves it. */
+export interface SearchResponse {
+  query: string
+  items: Array<InstrumentInfo & { providerId: string }>
+}
+
+/** The panel's view of a candle series. */
+export interface OhlcvResponse {
+  providerId: string
+  symbol: string
+  timeframe: string
+  candles: Candle[]
+}
+
+/**
+ * What the chart column is showing right now.
+ *
+ * Deliberately small: enough for the agent to know a chart exists and what is
+ * on it, not a mirror of the panel's internals. Anything the model needs in
+ * detail it can fetch itself through the ordinary market tools.
+ */
+export interface ChartView {
+  symbol: string
+  timeframe: string
+  bars: number
+  /** ISO time of the first and last bar on screen. */
+  from?: string | undefined
+  to?: string | undefined
+  /** Last close as displayed. */
+  close?: number | undefined
+  /** Whether the panel is refreshing live. */
+  live: boolean
+  /**
+   * Who chose this chart: the user typed it, the column followed the
+   * conversation to it, or it is a tool result rendered verbatim.
+   */
+  origin: 'user' | 'agent' | 'followed'
+  /** Agent marks currently drawn on this chart. */
+  marks?: number | undefined
+  /** Marks the chart refused because they fell outside its window. */
+  marksDropped?: number | undefined
+  /** Timeframe the marks were authored on. */
+  marksTimeframe?: string | undefined
+}
+
+/**
+ * Validate a `view` publication. The panel is trusted code, but this crosses a
+ * process boundary from a browser and lands in a model's context — a malformed
+ * or oversized value would become a prompt-injection surface.
+ * @param payload - the decoded body.
+ * @returns the validated view, or a message naming what was wrong.
+ */
+export function readChartView(payload: unknown): ChartView | string {
+  if (typeof payload !== 'object' || payload === null) return 'view must be an object'
+  const b = payload as Record<string, unknown>
+  const symbol = b['symbol']
+  const timeframe = b['timeframe']
+  if (typeof symbol !== 'string' || symbol.trim() === '' || symbol.length > 64) return 'view.symbol invalid'
+  if (typeof timeframe !== 'string' || !TIMEFRAMES.has(timeframe)) return 'view.timeframe invalid'
+  const bars = typeof b['bars'] === 'number' && Number.isFinite(b['bars']) ? Math.max(0, Math.trunc(b['bars'])) : 0
+  const iso = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length <= 32 && !Number.isNaN(Date.parse(v)) ? v : undefined
+  const close = typeof b['close'] === 'number' && Number.isFinite(b['close']) ? b['close'] : undefined
+  const origin = b['origin'] === 'agent' ? 'agent' : b['origin'] === 'followed' ? 'followed' : 'user'
+  // Counts and a known timeframe only. This boundary stays scalars-only on
+  // purpose: the marks' labels and sources are model-authored text the model
+  // already wrote, and echoing them back through a prompt adds nothing but a
+  // round trip for injected content.
+  const count = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? Math.min(100, Math.max(0, Math.trunc(v))) : undefined
+  const marksTimeframe = typeof b['marksTimeframe'] === 'string' && TIMEFRAMES.has(b['marksTimeframe'])
+    ? b['marksTimeframe']
+    : undefined
+  return {
+    symbol: symbol.trim(), timeframe, bars,
+    from: iso(b['from']), to: iso(b['to']), close,
+    live: b['live'] === true, origin,
+    marks: count(b['marks']), marksDropped: count(b['marksDropped']), marksTimeframe,
+  }
+}
+
+
+/**
+ * One line describing the chart for a model's context. Empty when no chart is
+ * up — the prompt layer treats empty text as no contribution, so an idle panel
+ * costs nothing.
+ * @param view - the current view, if any.
+ * @returns the summary line, or ''.
+ */
+export function describeChartView(view: ChartView | undefined): string {
+  if (view === undefined) return ''
+  const span = view.from !== undefined && view.to !== undefined ? `, ${view.from} to ${view.to}` : ''
+  const price = view.close !== undefined ? `, last ${view.close}` : ''
+  const who = view.origin === 'user'
+    ? 'the user opened it'
+    : view.origin === 'followed'
+      // Say plainly that the column chose this, or the model will assert the
+      // user's intent about an instrument they never asked for.
+      ? 'the column followed your analysis here — the user did not pick this symbol'
+      : 'from a tool result'
+  // Whether the agent's own drawings actually landed is the one thing it
+  // cannot infer: annotate_chart returning successfully says nothing about
+  // what the user's column decided to render.
+  const drawn = view.marks !== undefined && view.marks > 0
+    ? ` Your annotate_chart marks are drawn on it (${view.marks} from the ${view.marksTimeframe ?? view.timeframe} analysis`
+      + `${view.marksDropped !== undefined && view.marksDropped > 0
+        ? `; ${view.marksDropped} fell outside this window and are not shown` : ''}).`
+    : ''
+  return (
+    `The user's chart panel is showing ${view.symbol} at ${view.timeframe} `
+    + `(${view.bars} bars${span}${price}; ${view.live ? 'refreshing live' : 'paused'}; ${who}).${drawn} `
+    + `You can see this chart — do not ask for a screenshot of it. `
+    + `Call get_chart_view for the same facts on demand, or the market tools for the data behind it.`
+  )
+}
+/**
+ * Agent preset ids that receive the per-turn chart-panel context line.
+ * Trading voice + chart state only apply under these presets; standard /
+ * minimal idle chat must not inherit the panel snapshot.
+ */
+export const CHART_CONTEXT_PRESETS: ReadonlySet<string> = new Set(['trading', 'analyst'])
+
+/** Read the session's agentPreset from a prompt-assembly context blob. */
+export function resolveAgentPreset(context?: unknown): string | undefined {
+  const c = context as {
+    agent?: { session?: { header?: { agentPreset?: unknown }, agentPreset?: unknown } }
+  } | undefined
+  const raw = c?.agent?.session?.header?.agentPreset ?? c?.agent?.session?.agentPreset
+  return typeof raw === 'string' && raw.length > 0 ? raw : undefined
+}
+
+/**
+ * Per-turn chart context text, gated by agent preset.
+ * Empty when the preset is not trading/analyst or the panel is idle —
+ * the prompt layer treats empty as no contribution.
+ */
+export function chartPanelContextText(context: unknown, view: ChartView | undefined): string {
+  const preset = resolveAgentPreset(context)
+  if (preset === undefined || !CHART_CONTEXT_PRESETS.has(preset)) return ''
+  return describeChartView(view)
+}
+
+
+
+/**
+ * Validate a `search` request. Same rule as `ohlcv`: nothing unchecked from the
+ * browser reaches a provider, and this text goes on to become a URL query.
+ * @param payload - the decoded body.
+ * @returns the trimmed query (and optional provider), or a message naming what was wrong.
+ */
+export function readSearchRequest(payload: unknown): { query: string; providerId: string | undefined } | string {
+  if (typeof payload !== 'object' || payload === null) return 'request must be an object'
+  const body = payload as Record<string, unknown>
+  const q = body['query']
+  if (typeof q !== 'string') return 'query must be a string'
+  const query = q.trim()
+  if (query === '') return 'query must not be empty'
+  if (query.length > 64) return 'query is implausibly long'
+  const id = body['providerId']
+  if (id !== undefined && typeof id !== 'string') return 'providerId must be a string'
+  return { query, providerId: id }
+}
+
+/** The slice of the market-data hub this channel needs (kept narrow for testing). */
+export interface MarketDataLike {
+  provider(id?: string): MarketDataProvider
+  resolveProvider?(symbol?: string, explicitId?: string): MarketDataProvider
+  searchWithProvider?(query: string, providerId?: string): Promise<Array<{ providerId: string; item: InstrumentInfo }>>
+  list?(): string[]
+  getWatchlist?(): Promise<WatchlistResponse>
+  addToWatchlist?(item: { symbol: string; group?: string | undefined; notes?: string | undefined }): Promise<boolean>
+  removeFromWatchlist?(symbol: string): Promise<boolean>
+}
+
+/**
+ * Serve one decoded endpoint against the market-data hub.
+ * @param marketData - the hub (or a fake with the same two members).
+ * @param endpoint - channel-relative endpoint.
+ * @param payload - decoded request body.
+ * @returns the endpoint's value.
+ * @throws when the endpoint is unknown or the request is malformed; the caller
+ *   folds this into the RPC error branch.
+ */
+export async function serveMarketEndpoint(
+  marketData: MarketDataLike,
+  endpoint: string,
+  payload: unknown,
+  onView?: (view: ChartView) => void,
+): Promise<
+  | SymbolsResponse
+  | OhlcvResponse
+  | DerivativesResponse
+  | CvdResponse
+  | MoneyFlowResponse
+  | OrderbookResponse
+  | LargeOrdersResponse
+  | FundamentalsResponse
+  | ProvidersResponse
+  | WatchlistResponse
+  | SearchResponse
+  | { ok: boolean; symbol?: string | undefined }
+  | { ok: true }
+> {
+  const getProvider = (sym?: string, id?: string) => {
+    return typeof marketData.resolveProvider === 'function'
+      ? marketData.resolveProvider(sym, id)
+      : marketData.provider(id)
+  }
+
+  if (endpoint === ENDPOINTS.providers) {
+    const ids = typeof marketData.list === 'function' ? marketData.list() : []
+    const providers = await Promise.all(ids.map(async id => {
+      try {
+        const p = marketData.provider(id)
+        let timeframes: string[] | undefined
+        try {
+          const seen = new Set<string>()
+          for (const inst of await Promise.race([p.listSymbols(), new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500))])) for (const tf of inst.timeframes ?? []) seen.add(tf)
+          if (seen.size > 0) timeframes = [...seen]
+        } catch { /* unknown: client shows the full set */ }
+        return timeframes ? { id: p.id, description: p.description, timeframes } : { id: p.id, description: p.description }
+      } catch {
+        return { id, description: id }
+      }
+    }))
+    return { providers }
+  }
+
+  if (endpoint === ENDPOINTS.view) {
+    const view = readChartView(payload)
+    if (typeof view === 'string') throw new Error(view)
+    onView?.(view)
+    return { ok: true }
+  }
+
+  if (endpoint === ENDPOINTS.symbols) {
+    const id = typeof payload === 'object' && payload !== null
+      ? (payload as Record<string, unknown>)['providerId']
+      : undefined
+    if (id !== undefined && typeof id !== 'string') throw new Error('providerId must be a string')
+    const provider = marketData.provider(id)
+    return { providerId: provider.id, description: provider.description, symbols: await provider.listSymbols() }
+  }
+
+  if (endpoint === ENDPOINTS.search) {
+    const request = readSearchRequest(payload)
+    if (typeof request === 'string') throw new Error(request)
+    if (typeof marketData.searchWithProvider === 'function') {
+      const hits = await marketData.searchWithProvider(request.query, request.providerId)
+      return { query: request.query, items: hits.map(h => ({ ...h.item, providerId: h.providerId })) }
+    }
+    // Hubs that only expose provider() (test fakes, older hosts): ask the one provider.
+    const provider = marketData.provider(request.providerId)
+    const items = provider.search === undefined ? [] : await provider.search(request.query)
+    return { query: request.query, items: items.map(item => ({ ...item, providerId: provider.id })) }
+  }
+
+  if (endpoint === ENDPOINTS.ohlcv) {
+    const request = readOhlcvRequest(payload)
+    if (typeof request === 'string') throw new Error(request)
+    const provider = getProvider(request.symbol, request.providerId)
+    const candles = await provider.getOhlcv({
+      symbol: request.symbol,
+      timeframe: request.timeframe,
+      limit: request.limit,
+      ...request.end !== undefined ? { end: request.end } : {},
+    })
+    return { providerId: provider.id, symbol: request.symbol, timeframe: request.timeframe, candles }
+  }
+
+  if (endpoint === ENDPOINTS.derivatives) {
+    // Same symbol/provider checks as ohlcv; the timeframe is irrelevant but must still be valid.
+    const request = readOhlcvRequest({ ...(typeof payload === 'object' && payload !== null ? payload : {}), timeframe: '5m' })
+    if (typeof request === 'string') throw new Error(request)
+    const provider = getProvider(request.symbol, request.providerId)
+    const derivatives = provider.getDerivatives === undefined ? null : await provider.getDerivatives(request.symbol)
+    return { providerId: provider.id, symbol: request.symbol, derivatives }
+  }
+
+  if (endpoint === ENDPOINTS.cvd) {
+    const request = readOhlcvRequest(payload)
+    if (typeof request === 'string') throw new Error(request)
+    const provider = getProvider(request.symbol, request.providerId)
+    const bars = provider.getCvd === undefined ? null : await provider.getCvd(request.symbol, request.timeframe, request.limit)
+    return { providerId: provider.id, symbol: request.symbol, timeframe: request.timeframe, bars }
+  }
+
+  if (endpoint === ENDPOINTS.moneyflow) {
+    const request = readOhlcvRequest({ ...(typeof payload === 'object' && payload !== null ? payload : {}), timeframe: '5m' })
+    if (typeof request === 'string') throw new Error(request)
+    const provider = getProvider(request.symbol, request.providerId)
+    const moneyFlow = provider.getMoneyFlow === undefined ? null : await provider.getMoneyFlow(request.symbol)
+    return { providerId: provider.id, symbol: request.symbol, moneyFlow }
+  }
+
+  if (endpoint === ENDPOINTS.orderbook) {
+    const request = readOhlcvRequest({ ...(typeof payload === 'object' && payload !== null ? payload : {}), timeframe: '5m' })
+    if (typeof request === 'string') throw new Error(request)
+    const provider = getProvider(request.symbol, request.providerId)
+    const orderbook = provider.getOrderbook === undefined ? null : await provider.getOrderbook(request.symbol)
+    return { providerId: provider.id, symbol: request.symbol, orderbook }
+  }
+
+  if (endpoint === ENDPOINTS.fundamentals) {
+    const request = readOhlcvRequest({ ...(typeof payload === 'object' && payload !== null ? payload : {}), timeframe: '5m' })
+    if (typeof request === 'string') throw new Error(request)
+    const provider = getProvider(request.symbol, request.providerId)
+    const fundamentals = provider.getFundamentals === undefined ? null : await provider.getFundamentals(request.symbol)
+    return { providerId: provider.id, symbol: request.symbol, fundamentals }
+  }
+
+  if (endpoint === ENDPOINTS.watchlist) {
+    if (typeof marketData.getWatchlist === 'function') {
+      return await marketData.getWatchlist()
+    }
+    return {
+      items: [
+        { symbol: 'BTCUSDT', group: '加密货币', notes: '大饼基准' },
+        { symbol: 'ETHUSDT', group: '加密货币', notes: '以太二饼' },
+        { symbol: 'SOLUSDT', group: '加密货币', notes: 'SOL' },
+        { symbol: 'sh000001', group: 'A股核心', notes: '上证指数' },
+        { symbol: '600519', group: 'A股核心', notes: '贵州茅台' },
+        { symbol: '000001', group: 'A股核心', notes: '平安银行' },
+      ],
+      groups: ['加密货币', 'A股核心'],
+    }
+  }
+
+  if (endpoint === ENDPOINTS.watchlistAdd) {
+    const sym = typeof (payload as Record<string, unknown> | null)?.['symbol'] === 'string'
+      ? ((payload as Record<string, unknown>)['symbol'] as string).trim()
+      : ''
+    const grp = typeof (payload as Record<string, unknown> | null)?.['group'] === 'string'
+      ? ((payload as Record<string, unknown>)['group'] as string).trim()
+      : '自选'
+    const notes = typeof (payload as Record<string, unknown> | null)?.['notes'] === 'string'
+      ? (payload as Record<string, unknown>)['notes'] as string
+      : undefined
+    if (typeof marketData.addToWatchlist === 'function') {
+      const ok = await marketData.addToWatchlist({ symbol: sym, group: grp, notes })
+      return { ok, symbol: sym }
+    }
+    return { ok: true, symbol: sym }
+  }
+
+  if (endpoint === ENDPOINTS.watchlistRemove) {
+    const sym = typeof (payload as Record<string, unknown> | null)?.['symbol'] === 'string'
+      ? ((payload as Record<string, unknown>)['symbol'] as string).trim()
+      : ''
+    if (typeof marketData.removeFromWatchlist === 'function') {
+      const ok = await marketData.removeFromWatchlist(sym)
+      return { ok, symbol: sym }
+    }
+    return { ok: true, symbol: sym }
+  }
+
+  throw new Error(`unknown endpoint '${endpoint}'`)
+}

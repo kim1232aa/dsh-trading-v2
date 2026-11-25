@@ -1,0 +1,3372 @@
+/**
+ * The candlestick card claiming the `tool.call.toolview` slot for
+ * `market_snapshot`, `get_ohlcv`, and `annotate_chart`. Reads the durable,
+ * model-invisible chart payload from `block.meta`; degrades to the raw
+ * rendered text when the payload is absent.
+ *
+ * Extensibility: annotation rendering is an open registry. A renderer is a
+ * PURE function from an annotation object to declarative draw primitives
+ * (hline / region / polyline) — it never touches the charting library, so
+ * third-party renderers survive chart re-inits (tab switch, chip toggle,
+ * theme change) and klinecharts upgrades. Core types 'level', 'zone', 'path'
+ * go through the same registry; unknown types without a renderer fall back
+ * to a textual row in the annotations table.
+ */
+import { Component, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import type { CSSProperties, ErrorInfo, ReactNode } from 'react'
+import { dispose, init, registerIndicator, registerOverlay, utils } from 'klinecharts'
+import type { Chart, KLineData } from 'klinecharts'
+import {
+  createCandleDataLoader,
+  createIndicatorInPane,
+  syncIndicatorInPane,
+  ensureChartThemes,
+  hasIndicator,
+  overrideIndicator as overrideInd,
+  periodFromTimeframe,
+  removeIndicator as removeInd,
+  tooltipFeatureIcon,
+  tooltipOf,
+  yAxisNameForCoord,
+} from './kline-v10.js'
+import type { BarSubscriber } from './kline-v10.js'
+import { ChartTools } from './ChartTools.js'
+import { ChartChrome, applyDisplayToChart, getDisplaySettings } from './ChartChrome.js'
+import type { ChromeChip, ChromeIndicator } from './ChartChrome.js'
+import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
+import { getColumnOpen, publishLatestChart, subscribeColumn } from './latest.js'
+import type { PaneIds } from './LessonLayer.js'
+import { annotationDigest, contentText, readCallFallbackPayload, readChartPayload } from './payload.js'
+import type { ChartAnnotation, ChartPayload, ChartScenario, ChartTimeframeData } from './payload.js'
+import type { PanelDerivativeBar, PanelDerivatives, PanelLargeOrders, PanelLargeTrade } from './market-client.js'
+import { contractOpenInterest, displayedRows, dropCrossedWalls, filterWallsByMarket, wallDisplay, formatWallAge, isSpotWallMarket, matchDerivativeHistory, postureColor } from './market-client.js'
+import type { WallMarketFilter } from './market-client.js'
+import { regimeSnapshot } from '../tools/regime.js'
+import { rsiGridStateText } from '../tools/rsi-grid.js'
+import type { RsiGridReport } from '../tools/rsi-grid.js'
+import { regimeSeries } from '../tools/chart-payload.js'
+import { evasiveSuperTrend, evasiveSuperTrendIndicator } from './indicators/evasive-st.js'
+import { nadarayaWatsonIndicator, NW_ALERTS, NW_COLOR_PRESETS, NW_DEFAULTS, NW_KERNELS, NW_PRESET_NAMES, NW_SOURCES, migrateNwParams, nwAlertEvents } from './indicators/nadaraya-watson.js'
+import { orderBlockBreaker, orderBlockIndicator } from './indicators/order-blocks.js'
+import { calculateVbProRead, enabledVbAlerts, intToHex, VB_ALERTS, VB_DEFAULTS, vbProReadIndicator } from './indicators/vb-pro-read.js'
+import { dualViewHtfIndicator, DV_DEFAULTS, PATTERN_KEYS, PATTERN_CN, HTF_TF_LABELS, PATTERN_FILTER_OPTS, SIZE_OPTS, TREND_OPTS, dvAlertEvents } from './indicators/dual-view-htf-patterns.js'
+import { mtfSRZones, mtfSRIndicator, mtfSourceTimeframeSeconds } from './indicators/mtf-sr.js'
+import { entrySignalIndicator } from './indicators/entry-signal.js'
+import { rsiGridIndicator, rsiGridCumIndicator, rsiGridMarksIndicator } from './indicators/rsi-grid.js'
+import { revPointIndicator, REVPOINT_TABLE_W, REVPOINT_PARAM_DEFAULTS, REVPOINT_OI_EXCHANGES, REVPOINT_ALERTS, migrateRevPointParams, revPointAlertEvents } from './indicators/revpoint.js'
+import { kPatternIndicator, KP_ALERT, KP_ALERTS, KP_BAIDU_BEAR_INDICES, KP_BAIDU_BULL_INDICES, KP_BAIDU_PLOTS, KP_BAIDU_SHOW, KP_BEAR_INDICES, KP_BG_COLOR, KP_BG_ON, KP_BULL_INDICES, KP_COLOR, KP_DEFAULTS, KP_FONT, KP_FORMING, KP_LABEL_MODES, KP_LAST, KP_MODE, KP_PLOTS, KP_SHOW, KP_THEME, kpAlertEvents } from './indicators/aicoin-kpattern.js'
+import { aicoinTdIndicator, aicoinTdMarksIndicator, migrateTdParams, TD_DEFAULTS, TD_MARK_RESERVE, TD_MODES, tdAlertEvents, tdWantsMarks, tdWantsPane } from './indicators/aicoin-td.js'
+import { volTierIndicator } from './indicators/vol-tier.js'
+import { cvdFlowIndicator } from './indicators/cvd-flow.js'
+import type { PanelCvdBar } from './market-client.js'
+import { ohlcOffsetRightForTopLeft } from './indicators/revpoint-layout.js'
+import { detectPricePrecision, formatPrice } from './precision.js'
+import { createAnnotationOverlays, hitDots, tradeTimeText } from './annotation-overlays.js'
+import { registerProOverlays } from './overlays/index.js'
+import { createMainPaneTooltipFold, SUBPLOT_TOOLTIP } from './indicator-tooltip.js'
+import { initialChartMount, observeNearViewport } from './viewport-lifecycle.js'
+
+export { evasiveSuperTrend } from './indicators/evasive-st.js'
+export { nadarayaWatsonTrend } from './indicators/nadaraya-watson.js'
+export { orderBlockBreaker } from './indicators/order-blocks.js'
+export { mtfSRZones } from './indicators/mtf-sr.js'
+
+const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 })
+
+function formatUsdtCnLocal(n: number): string {
+  if (!Number.isFinite(n)) return '—'
+  const sign = n < 0 ? '-' : ''
+  const abs = Math.abs(n)
+  if (abs >= 1e8) return `${sign}${(abs / 1e8).toFixed(2)}亿`
+  if (abs >= 1e4) return `${sign}${(abs / 1e4).toFixed(1)}万`
+  if (abs < 0.5) return `${sign}0`
+  return `${sign}${abs.toFixed(0)}`
+}
+let chartDomSeq = 0
+
+const CHART_HEIGHT = 480
+/** Sub-pane target height. Keep modest so fill-mode leaves room for candles. */
+const PANE_HEIGHT = 72
+/** Floor for the candle pane when redistributing sub-pane heights after layout. */
+const CANDLE_PANE_MIN = 200
+/** fill-mode CSS minHeight — must clear chrome + a few sub-panes + candle floor. */
+const FILL_MIN_HEIGHT = 480
+
+/**
+ * klinecharts defaults to 'Helvetica Neue', which Windows lacks — CJK captions
+ * then fall back to whatever the canvas picks. Name real UI faces per platform.
+ */
+const FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif'
+
+type Palette = {
+  text: string
+  faint: string
+  line: string
+  up: string
+  down: string
+  neckline: string
+  target: string
+  invalidation: string
+}
+
+const LIGHT: Palette = {
+  text: '#333c45', faint: '#8b949e', line: '#e5e8eb', up: '#26a17b', down: '#e0563f',
+  neckline: '#b08800', target: '#3b7dd8', invalidation: '#a475e0',
+}
+const DARK: Palette = {
+  text: '#c9d1d9', faint: '#768390', line: '#30363d', up: '#3ddc97', down: '#f47067',
+  neckline: '#d4a72c', target: '#539bf5', invalidation: '#b083f0',
+}
+
+/** AiCoin TD: sub-pane lines (source plot) and/or numbers on the candles, per its 显示方式 param. */
+function syncAicoinTd(chart: Chart, s: { params: number[]; visible: boolean }, dark: boolean): void {
+  const p = dark ? DARK : LIGHT
+  const ext = { up: p.up, down: p.down }
+  const sync = (want: boolean, name: string, paneId: string, isStack: boolean): void => {
+    const has = hasIndicator(chart, paneId, name)
+    if (!want) { if (has) removeInd(chart, paneId, name); return }
+    if (has) overrideInd(chart, { name, calcParams: s.params, extendData: ext }, paneId)
+    else createIndicatorInPane(chart, { name, calcParams: s.params, extendData: ext }, { paneId, isStack, height: PANE_HEIGHT })
+  }
+  sync(s.visible && tdWantsPane(s.params), 'AICOIN_TD', 'pane_aicoin_td', false)
+  sync(s.visible && tdWantsMarks(s.params), 'AICOIN_TD_MARKS', 'candle_pane', true)
+}
+
+/** Chart theme handed to the AiCoin ports (their colours follow the candles unless the user turns it off). */
+function kpThemeExt(dark: boolean, settings: IndicatorSettings): { up: string; down: string; bg: string; reserve: number } {
+  const p = dark ? DARK : LIGHT
+  const td = settings['AICOIN_TD']
+  const tdOnCandles = td !== undefined && td.visible && tdWantsMarks(td.params)
+  return { up: p.up, down: p.down, bg: dark ? 'rgba(13, 17, 23, 0.85)' : 'rgba(255, 255, 255, 0.9)', reserve: tdOnCandles ? TD_MARK_RESERVE : 0 }
+}
+
+/* ------------------------------------------------------------------ */
+/* Open annotation-renderer registry (the ecosystem seam)              */
+/* ------------------------------------------------------------------ */
+
+export type DrawPrimitive =
+  | { kind: 'hline'; price: number; label?: string; color?: string; dashed?: boolean }
+  | { kind: 'region'; low: number; high: number; label?: string; color?: string; startTime?: string; availableAt?: string }
+  | { kind: 'polyline'; points: { time: string; price: number }[]; label?: string; color?: string; dashed?: boolean; notes?: string[] }
+
+export type AnnotationRendererContext = {
+  /** Bumped only on breaking changes to DrawPrimitive/this context. */
+  contractVersion: 1
+  timeframe: string
+  close: number
+  palette: Palette
+  color?: string
+  roleOrdinal?: number
+}
+
+/**
+ * PURE translator from one annotation object to draw primitives. Runs on
+ * every chart re-init; must not keep state or touch the DOM. Throwing skips
+ * this annotation (logged), never the card.
+ */
+export type AnnotationRenderer = (
+  annotation: Record<string, unknown>,
+  ctx: AnnotationRendererContext,
+) => DrawPrimitive[]
+
+const annotationRenderers = new Map<string, AnnotationRenderer>()
+
+/** Last registration wins (logged); returns an unregister disposer. */
+export function registerAnnotationRenderer(type: string, renderer: AnnotationRenderer): () => void {
+  if (annotationRenderers.has(type)) {
+    console.warn(`[client-chart] annotation renderer for '${type}' replaced`)
+  }
+  annotationRenderers.set(type, renderer)
+  return () => {
+    if (annotationRenderers.get(type) === renderer) annotationRenderers.delete(type)
+  }
+}
+
+function roleColor(role: unknown, p: Palette): string {
+  switch (role) {
+    case 'support': return p.up
+    case 'resistance': return p.down
+    case 'neckline': return p.neckline
+    case 'target': return p.target
+    case 'invalidation': return p.invalidation
+    default: return p.faint
+  }
+}
+
+const ZONE_ROLE_COLORS_DARK: Record<string, readonly string[]> = {
+  support: ['#3ddc97', '#06b6d4', '#84cc16', '#14b8a6', '#38bdf8', '#22c55e'],
+  resistance: ['#f47067', '#ff9800', '#ec4899', '#f43f5e', '#fb7185', '#ef4444'],
+  neckline: ['#d4a72c', '#facc15', '#f59e0b'],
+  target: ['#539bf5', '#818cf8', '#60a5fa'],
+  invalidation: ['#b083f0', '#c084fc', '#a78bfa'],
+  other: ['#768390', '#94a3b8', '#64748b', '#a1a1aa'],
+}
+
+const ZONE_ROLE_COLORS_LIGHT: Record<string, readonly string[]> = {
+  support: ['#26a17b', '#0891b2', '#65a30d', '#0d9488', '#0284c7', '#16a34a'],
+  resistance: ['#e0563f', '#ea580c', '#db2777', '#e11d48', '#f43f5e', '#dc2626'],
+  neckline: ['#b08800', '#ca8a04', '#d97706'],
+  target: ['#3b7dd8', '#4f46e5', '#2563eb'],
+  invalidation: ['#a475e0', '#9333ea', '#7c3aed'],
+  other: ['#8b949e', '#64748b', '#475569', '#71717a'],
+}
+
+export function resolveAnnotationColor(a: Record<string, unknown>, p: Palette, roleOrdinal = 0): string {
+  const explicit = a['color']
+  if (typeof explicit === 'string' && /^#[0-9a-fA-F]{6}$/.test(explicit)) return explicit
+  if (a['type'] !== 'zone') return roleColor(a['role'], p)
+  const isLight = p.up === LIGHT.up
+  const table = isLight ? ZONE_ROLE_COLORS_LIGHT : ZONE_ROLE_COLORS_DARK
+  const roleKey = typeof a['role'] === 'string' && a['role'] in table ? a['role'] : 'other'
+  const list = table[roleKey]!
+  const idx = Number.isInteger(roleOrdinal) && roleOrdinal >= 0 ? roleOrdinal : 0
+  if (idx === 0) return roleColor(a['role'], p)
+  return list[idx % list.length]!
+}
+
+export function assignAnnotationColors(annotations: readonly Record<string, unknown>[], p: Palette): string[] {
+  const counts = new Map<string, number>()
+  return annotations.map((a) => {
+    const type = typeof a['type'] === 'string' ? a['type'] : ''
+    const role = typeof a['role'] === 'string' ? a['role'] : 'other'
+    const key = `${type}:${role}`
+    const ord = counts.get(key) ?? 0
+    counts.set(key, ord + 1)
+    return resolveAnnotationColor(a, p, ord)
+  })
+}
+
+function num(x: unknown): number | undefined {
+  return typeof x === 'number' && Number.isFinite(x) ? x : undefined
+}
+
+function str(x: unknown): string | undefined {
+  return typeof x === 'string' && x !== '' ? x : undefined
+}
+
+// Core renderers ride the same registry as third-party ones.
+registerAnnotationRenderer('level', (a, ctx) => {
+  const price = num(a['price'])
+  if (price === undefined) return []
+  const color = ctx.color ?? resolveAnnotationColor({ ...a, type: 'level' }, ctx.palette, ctx.roleOrdinal ?? 0)
+  return [{ kind: 'hline', price, dashed: true, color, ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {} }]
+})
+registerAnnotationRenderer('zone', (a, ctx) => {
+  const low = num(a['low'])
+  const high = num(a['high'])
+  if (low === undefined || high === undefined) return []
+  const color = ctx.color ?? resolveAnnotationColor({ ...a, type: 'zone' }, ctx.palette, ctx.roleOrdinal ?? 0)
+  return [{ kind: 'region', low, high, color,
+    ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {},
+    ...str(a['startTime']) !== undefined ? { startTime: str(a['startTime'])! } : {},
+    ...str(a['availableAt']) !== undefined ? { availableAt: str(a['availableAt'])! } : {},
+  }]
+})
+registerAnnotationRenderer('path', (a, ctx) => {
+  const raw = a['points']
+  if (!Array.isArray(raw)) return []
+  const notes: string[] = []
+  const points = raw.flatMap((p) => {
+    const rec = typeof p === 'object' && p !== null ? p as Record<string, unknown> : undefined
+    const time = rec !== undefined ? str(rec['time']) : undefined
+    const price = rec !== undefined ? num(rec['price']) : undefined
+    if (time === undefined || price === undefined) return []
+    notes.push(rec !== undefined ? str(rec['note']) ?? '' : '')
+    return [{ time, price }]
+  })
+  if (points.length < 2) return []
+  const color = ctx.color ?? resolveAnnotationColor({ ...a, type: 'path' }, ctx.palette, ctx.roleOrdinal ?? 0)
+  return [{ kind: 'polyline', points, dashed: true, color,
+    ...str(a['label']) !== undefined ? { label: str(a['label'])! } : {},
+    ...notes.some(n => n !== '') ? { notes } : {} }]
+})
+
+/* ------------------------------------------------------------------ */
+/* klinecharts wiring                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Trend overlay on every chart. */
+const WMA_PERIODS = [60, 100, 200]
+const WMA_COLORS = ['#FFA726', '#27C6DA', '#E65000']
+
+/**
+ * Linear-weighted MA ending at bar `i`: weights 1..p, newest heaviest.
+ * undefined until there are `p` bars. O(p) per bar — 1000 bars × 200 is 0.2M ops, fine.
+ */
+export function wmaAt(closes: readonly number[], i: number, p: number): number | undefined {
+  if (p < 1 || i < p - 1 || i >= closes.length) return undefined
+  let sum = 0
+  for (let k = 0; k < p; k++) sum += closes[i - k]! * (p - k)
+  return sum / (p * (p + 1) / 2)
+}
+
+/** up, down — the down red is sampled from the reference shot, the green is TradingView's pair for it. */
+const ST_COLORS = ['#089981', '#F23645']
+
+/**
+ * TradingView `ta.supertrend(factor, atrPeriod)`: Wilder ATR around hl2, bands
+ * only ratchet toward price, direction flips on a close through the active band.
+ * Each bar carries `up` OR `dn`, so a flip leaves a gap instead of a vertical join.
+ * Empty `{}` until the ATR window is full.
+ */
+export function supertrend(
+  bars: readonly { high: number; low: number; close: number }[],
+  period: number,
+  factor: number,
+): { up?: number; dn?: number }[] {
+  const out: { up?: number; dn?: number }[] = []
+  let atr: number | undefined
+  let trSum = 0
+  let lower = 0
+  let upper = 0
+  let down: boolean | undefined
+  for (let i = 0; i < bars.length; i++) {
+    const { high, low, close } = bars[i]!
+    const prevClose = bars[i - 1]?.close
+    const tr = prevClose === undefined
+      ? high - low
+      : Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose))
+    if (atr !== undefined) atr = (atr * (period - 1) + tr) / period
+    else {
+      trSum += tr
+      if (i === period - 1) atr = trSum / period
+    }
+    if (atr === undefined) {
+      out.push({})
+      continue
+    }
+    const mid = (high + low) / 2
+    let lo = mid - factor * atr
+    let hi = mid + factor * atr
+    if (down !== undefined && prevClose !== undefined) {
+      if (!(lo > lower || prevClose < lower)) lo = lower
+      if (!(hi < upper || prevClose > upper)) hi = upper
+    }
+    down = down === undefined ? true : down ? !(close > hi) : close < lo
+    lower = lo
+    upper = hi
+    out.push(down ? { dn: hi } : { up: lo })
+  }
+  return out
+}
+/* User-editable indicator params: one store for every chart on the    */
+/* page, persisted in localStorage.                                    */
+/* ------------------------------------------------------------------ */
+
+/** kind: number (default) | select (options[i] ↔ value i) | bool (0/1 checkbox) | color (0xRRGGBB int). */
+type ParamSpec = { label: string; min: number; max: number; step: number; kind?: 'number' | 'select' | 'bool' | 'color'; options?: string[] }
+const boolP = (label: string): ParamSpec => ({ label, min: 0, max: 1, step: 1, kind: 'bool' })
+const colorP = (label: string): ParamSpec => ({ label, min: 0, max: 0xFFFFFF, step: 1, kind: 'color' })
+const period = (label: string): ParamSpec => ({ label, min: 1, max: 500, step: 1 })
+
+export const EDITABLE: {
+  name: string
+  title: string
+  defaults: number[]
+  defaultVisible?: boolean
+  /** Sub-pane id; omitted = drawn on the price pane. */
+  pane?: string
+  params: ParamSpec[]
+}[] = [
+  { name: 'WMA', title: 'WMA', defaults: WMA_PERIODS, params: [period('周期1'), period('周期2'), period('周期3')] },
+  { name: 'SUPERTREND', title: '超级趋势', defaults: [60, 4], params: [period('ATR周期'), { label: '倍数', min: 0.1, max: 20, step: 0.1 }] },
+  { name: 'EVASIVE_ST', title: '避险超级趋势(LuxAlgo)', defaults: [10, 3.0, 1.0, 0.5], defaultVisible: false, params: [period('ATR周期'), { label: '倍数', min: 0.1, max: 20, step: 0.1 }, { label: '噪音阈值', min: 0.1, max: 10, step: 0.1 }, { label: '避险Alpha', min: 0, max: 5, step: 0.1 }] },
+  // 1:1 with pine/nadaraya-watson.pine inputs L31-49 (same order), then one toggle per alertcondition L159-163.
+  { name: 'NW_TREND', title: '核回归趋势(QuantAlgo)', defaults: [...NW_DEFAULTS], defaultVisible: false, params: [
+    { label: '预设配置', min: 0, max: 2, step: 1, kind: 'select', options: [...NW_PRESET_NAMES] },
+    { label: '源', min: 0, max: NW_SOURCES.length - 1, step: 1, kind: 'select', options: [...NW_SOURCES] },
+    { label: '核类型', min: 0, max: NW_KERNELS.length - 1, step: 1, kind: 'select', options: [...NW_KERNELS] },
+    { label: '回溯窗口', min: 1, max: 500, step: 1 }, { label: '核带宽', min: 1, max: 1000, step: 1 },
+    { label: '带宽倍数', min: 0.1, max: 100, step: 0.1 }, { label: '相对权重(RQ)', min: 0.1, max: 100, step: 0.25 },
+    boolP('显示残差带'), { label: '带倍数', min: 0.1, max: 100, step: 0.1 },
+    boolP('显示渐变填充'), boolP('显示反转标记'),
+    { label: '颜色预设', min: 0, max: 5, step: 1, kind: 'select', options: [...NW_COLOR_PRESETS] },
+    colorP('看涨色'), colorP('看跌色'),
+    boolP('启用K线着色'), { label: 'K线着色透明度', min: 0, max: 100, step: 1 },
+    boolP('启用背景着色'), { label: '背景着色透明度', min: 0, max: 100, step: 1 },
+    ...NW_ALERTS.map(a => boolP(`提醒:${a.cn}`)),
+  ] },
+  { name: 'OB_BB', title: '订单块/破坏块(RWB)', defaults: [5, 5, 20], defaultVisible: false, params: [period('Swing左'), period('Swing右'), period('等待K线')] },
+  { name: 'VB_PRO_READ', title: '波动带Pro-Read(Indicatr)', defaults: [...VB_DEFAULTS], defaultVisible: false, params: [
+    { label: '带类型', min: 0, max: 2, step: 1, kind: 'select', options: ['布林', '肯特纳', '唐奇安'] }, { label: '周期', min: 2, max: 500, step: 1 }, { label: '布林倍数', min: 0.1, max: 20, step: 0.1 }, { label: '肯特纳ATR倍数', min: 0.1, max: 20, step: 0.1 },
+    { label: '走带回看', min: 2, max: 500, step: 1 }, { label: '走带最少收盘', min: 1, max: 500, step: 1 }, { label: '外区位置', min: 0.5, max: 1, step: 0.05 }, { label: 'ADX周期', min: 2, max: 500, step: 1 }, { label: 'ADX趋势阈值', min: 1, max: 100, step: 0.5 },
+    boolP('显示挤压'), boolP('标均值回归'), colorP('走带上/多'), colorP('走带下/空'), colorP('中性'),
+    ...VB_ALERTS.map(a => boolP(`提醒:${a.cn}`)),
+  ] },
+  { name: 'DUAL_VIEW_HTF', title: '双视HTF形态(theUltimator5)', defaults: [...DV_DEFAULTS], defaultVisible: false, params: [
+    { label: '高周期', min: 0, max: 9, step: 1, kind: 'select', options: [...HTF_TF_LABELS] },
+    { label: '浮动K数量', min: 1, max: 10, step: 1 }, { label: 'K宽度(bars)', min: 1, max: 100, step: 1 },
+    { label: 'K间距', min: 0, max: 50, step: 1 }, { label: '右缘偏移', min: 0, max: 200, step: 1 },
+    { label: '历史回看(HTF)', min: 10, max: 300, step: 1 },
+    boolP('显示浮动HTF'), boolP('历史形态画到图上'),
+    colorP('多实体'), colorP('多边框'), colorP('空实体'), colorP('空边框'),
+    { label: '实体透明度', min: 0, max: 100, step: 1 }, { label: '线宽', min: 1, max: 10, step: 1 },
+    boolP('显示趋势线'), colorP('MA颜色'), { label: 'MA线宽', min: 1, max: 5, step: 1 },
+    { label: '趋势算法', min: 0, max: 1, step: 1, kind: 'select', options: [...TREND_OPTS] },
+    { label: 'MA周期', min: 1, max: 200, step: 1 },
+    { label: '形态筛选', min: 0, max: 2, step: 1, kind: 'select', options: [...PATTERN_FILTER_OPTS] },
+    ...PATTERN_KEYS.map(k => boolP(PATTERN_CN[k])),
+    { label: '文字大小', min: 0, max: 3, step: 1, kind: 'select', options: [...SIZE_OPTS] },
+    boolP('显示ⓘ说明'), colorP('多标签色'), colorP('空标签色'),
+    { label: 'Doji敏感度', min: 0.01, max: 0.5, step: 0.01 },
+    boolP('中心周期标签'), colorP('中心标签色'),
+    { label: '中心标签大小', min: 0, max: 3, step: 1, kind: 'select', options: [...SIZE_OPTS] },
+    { label: '标签下偏移', min: 0, max: 20, step: 1 },
+    boolP('水平参考线'), colorP('参考线色'), { label: '参考线宽', min: 1, max: 5, step: 1 },
+    boolP('提醒:HTF形态'),
+  ] },
+  { name: 'MTF_SR', title: '多周期支撑阻力(Syndicate)', defaults: [5], defaultVisible: false, params: [period('Pivot周期')] },
+  // 1:1 with the AiCoin K线形态 script + Baidu Finance / TradingCentral 24 candlestick patterns.
+  { name: 'AICOIN_KPATTERN', title: 'K线形态(AiCoin+百度股市通)', defaults: [...KP_DEFAULTS], defaultVisible: false, params: [
+    ...KP_PLOTS.map(p => boolP(p.title)),
+    ...KP_PLOTS.map(p => colorP(p.title + '色')),
+    { label: '字号', min: 6, max: 40, step: 1 }, boolP('文字背景'), colorP('背景色'),
+    ...KP_ALERTS.map(a => boolP('提醒:' + a.title + (a.direction === 'buy' ? '(买)' : '(卖)'))),
+    // Plugin-side display (not in the AiCoin script): theme colours, collision-avoiding labels, forming bar, showLast.
+    boolP('跟随主题配色'), { label: '标签模式', min: 0, max: KP_LABEL_MODES.length - 1, step: 1, kind: 'select', options: [...KP_LABEL_MODES] },
+    boolP('标注未收盘K线'), { label: '只看最近N根(0全部)', min: 0, max: 5000, step: 1 },
+    // Baidu Finance / TradingCentral additional candlestick patterns (slots 52..70).
+    ...KP_BAIDU_PLOTS.map(p => boolP(p.title)),
+  ] },
+  // AiCoin TD: 显示面板对齐 AiCoin 原生（仅显示9和13、回落点(卖出结构)#26a380、反弹点(买入结构)#cf3e3e）。
+  { name: 'AICOIN_TD', title: 'TD计数(AiCoin)', pane: 'pane_aicoin_td', defaults: [...TD_DEFAULTS], defaultVisible: false, params: [
+    boolP('显示回落点(UP)'), colorP('回落点 (卖出结构)'), { label: 'UP线宽', min: 1, max: 10, step: 1 },
+    boolP('显示反弹点(Down)'), colorP('反弹点 (买入结构)'), { label: 'Down线宽', min: 1, max: 10, step: 1 },
+    { label: '显示方式', min: 0, max: TD_MODES.length - 1, step: 1, kind: 'select', options: [...TD_MODES] },
+    boolP('仅显示9和13'), { label: '数字起始', min: 1, max: 99, step: 1 }, boolP('突出9/13'),
+    boolP('提醒:计数9'), boolP('提醒:计数13'),
+  ] },
+  { name: 'RSI_GRID', title: 'RSI网格（多空）', pane: 'pane_rsi_grid', defaults: [7, 30, 60, 10], params: [period('RSI周期'), period('多入阈值'), period('多平阈值'), period('累计阈值')] },
+  // 1:1 with pine/revpoint.pine v6.5 inputs (4 groups: 确认阈值 / 量能·OI / 过滤·显示 / 多周期趋势线) + 3 alertconditions.
+  { name: 'REVPOINT', title: '反转点标注 RevPoint', defaults: [...REVPOINT_PARAM_DEFAULTS], params: [
+    { label: '细档确认阈值 %', min: 0.1, max: 10, step: 0.1 },
+    { label: '粗档(大周期)阈值 %', min: 0.5, max: 20, step: 0.1 },
+    { label: '多周期pivot左右bar数', min: 1, max: 10, step: 1 },
+    boolP('15m'), boolP('30m'), boolP('1H'), boolP('2H'), boolP('4H'),
+    { label: '细档最少★数(0=全部)', min: 0, max: 3, step: 1 },
+    boolP('显示大周期顶底'), boolP('显示结构趋势线(虚=细 实=粗)'), boolP('显示C类(缩量后巨量反转K)'),
+    { label: '量均线周期', min: 5, max: 100, step: 1 },
+    { label: '爆量倍数(≥均值×N)', min: 1.2, max: 5, step: 0.1 },
+    { label: '极值回看小时数(★条件)', min: 0, max: 168, step: 1 },
+    { label: 'OI交易所', min: 0, max: REVPOINT_OI_EXCHANGES.length - 1, step: 1, kind: 'select', options: [...REVPOINT_OI_EXCHANGES] },
+    boolP('细档必须有量能配合'), boolP('仅K线收盘后确认(不闪)'),
+    boolP('开启多周期高/低点连线'), boolP('画斜向连线'), boolP('同时画水平折线(对照)'), boolP('从最新点向右画水平延伸线'),
+    boolP('右上角显示高周期R/S状态表'), boolP('右侧挂高周期价格签'), boolP('图上显示HTF诊断气泡'),
+    ...REVPOINT_ALERTS.map(a => boolP(`提醒:${a.cn}`)),
+  ] },
+  { name: 'VOL_TIER', title: '量比分档量能', pane: 'pane_vol', defaults: [4], defaultVisible: true, params: [period('量比周期')] },
+  { name: 'OI_POSTURE', title: '合约OI', pane: 'pane_oi_posture', defaults: [], params: [] },
+  { name: 'CVD_FLOW', title: '合约/现货CVD背离(币安)', pane: 'pane_cvd', defaults: [20, 3], defaultVisible: false, params: [period('背离回看根数'), { label: '停涨停跌判定根数', min: 1, max: 20, step: 1 }] },
+  { name: 'ENTRY_SIGNAL', title: '多空观察信号(未验证)', defaults: [60, 4], defaultVisible: false, params: [period('ST周期'), { label: 'ST倍数', min: 0.1, max: 20, step: 0.1 }] },
+  // Index layout is persisted (see wallDisplay in market-client.ts): append only.
+  { name: 'LARGE_WALLS', title: '大单墙(CoinGlass)', defaults: [100, 20, 8, 50, 30, 20, 1, 1, 1, 1], defaultVisible: false, params: [
+    { label: '合约挂单最低(万)', min: 0, max: 3000, step: 1 },
+    { label: '距离现价(%)', min: 1, max: 100, step: 1 },
+    { label: '单边展示条数', min: 2, max: 30, step: 1 },
+    { label: '合约成交最低(万)', min: 0, max: 3000, step: 1 },
+    { label: '现货挂单最低(万)', min: 0, max: 3000, step: 1 },
+    { label: '现货成交最低(万)', min: 0, max: 3000, step: 1 },
+    boolP('显示合约挂单'),
+    boolP('显示现货挂单'),
+    boolP('显示合约成交'),
+    boolP('显示现货成交'),
+  ] },
+]
+
+export type IndicatorSettings = Record<string, { params: number[]; visible: boolean }>
+
+/** Trust boundary (localStorage is user-editable): anything off-spec falls back to its default, per field. */
+export function sanitizeSettings(raw: unknown): IndicatorSettings {
+  const src = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : {}
+  return Object.fromEntries(EDITABLE.map(def => {
+    const e = src[def.name]
+    const entry = typeof e === 'object' && e !== null ? e as { params?: unknown; visible?: unknown } : {}
+    const raw: unknown[] = Array.isArray(entry.params) ? entry.params : []
+    // NW_TREND used to store [lookback, bandwidth, h_mult, band_mult]; AICOIN_TD used to store 0xffffff.
+    const given = def.name === 'NW_TREND' ? migrateNwParams(raw) : def.name === 'AICOIN_TD' ? migrateTdParams(raw) : def.name === 'REVPOINT' ? migrateRevPointParams(raw) : raw
+    const params = def.params.map((spec, i) => {
+      const v = given[i]
+      return typeof v === 'number' && v >= spec.min && v <= spec.max && (spec.step !== 1 || Number.isInteger(v))
+        ? v
+        : def.defaults[i]!
+    })
+    const visible = typeof entry.visible === 'boolean' ? entry.visible : (def.defaultVisible ?? true)
+    return [def.name, { params, visible }]
+  }))
+}
+
+const SETTINGS_KEY = 'dsh-trading.chart-indicators.v1'
+let settingsCache: IndicatorSettings | undefined
+const settingsListeners = new Set<() => void>()
+
+/** Read current indicator visibility/params (for panel features like 大单墙). */
+export function peekSettings(): IndicatorSettings {
+  return getSettings()
+}
+
+/** Subscribe to indicator settings changes. */
+export function subscribeSettings(fn: () => void): () => void {
+  settingsListeners.add(fn)
+  return () => { settingsListeners.delete(fn) }
+}
+
+function getSettings(): IndicatorSettings {
+  if (settingsCache === undefined) {
+    let raw: unknown = null
+    try { raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? 'null') } catch { /* absent or corrupt: defaults */ }
+    settingsCache = sanitizeSettings(raw)
+  }
+  return settingsCache
+}
+
+function setSettings(next: IndicatorSettings): void {
+  settingsCache = sanitizeSettings(next)
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settingsCache)) } catch { /* storage off: this session only */ }
+  for (const l of settingsListeners) l()
+}
+
+export type CoordType = 'normal' | 'percentage' | 'log'
+
+export interface AxisSettings {
+  coordType: CoordType
+  autoScale: {
+    candle: boolean
+    rsi: boolean
+    accLs: boolean
+    macd: boolean
+  }
+}
+
+export const DEFAULT_AXIS_SETTINGS: AxisSettings = {
+  coordType: 'normal',
+  autoScale: {
+    candle: true,
+    rsi: true,
+    accLs: true,
+    macd: true,
+  },
+}
+
+export function toYAxisType(coord: CoordType): string {
+  return yAxisNameForCoord(coord)
+}
+
+export function sanitizeAxisSettings(raw: unknown): AxisSettings {
+  const src = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : {}
+  const rawCoord = typeof src['coordType'] === 'string' ? src['coordType'] : 'normal'
+  const coordType: CoordType = (rawCoord === 'percentage' || rawCoord === 'log') ? rawCoord : 'normal'
+  const rawAuto = typeof src['autoScale'] === 'object' && src['autoScale'] !== null ? src['autoScale'] as Record<string, unknown> : {}
+  return {
+    coordType,
+    autoScale: {
+      candle: typeof rawAuto['candle'] === 'boolean' ? rawAuto['candle'] : true,
+      rsi: typeof rawAuto['rsi'] === 'boolean' ? rawAuto['rsi'] : true,
+      accLs: typeof rawAuto['accLs'] === 'boolean' ? rawAuto['accLs'] : true,
+      macd: typeof rawAuto['macd'] === 'boolean' ? rawAuto['macd'] : true,
+    },
+  }
+}
+
+const AXIS_SETTINGS_KEY = 'dsh-trading.chart-axis-settings.v1'
+let axisSettingsCache: AxisSettings | undefined
+const axisSettingsListeners = new Set<() => void>()
+
+export function getAxisSettings(): AxisSettings {
+  if (axisSettingsCache === undefined) {
+    let raw: unknown = null
+    try { raw = JSON.parse(localStorage.getItem(AXIS_SETTINGS_KEY) ?? 'null') } catch {}
+    axisSettingsCache = sanitizeAxisSettings(raw)
+  }
+  return axisSettingsCache
+}
+
+export function setAxisSettings(next: AxisSettings): void {
+  axisSettingsCache = sanitizeAxisSettings(next)
+  try { localStorage.setItem(AXIS_SETTINGS_KEY, JSON.stringify(axisSettingsCache)) } catch {}
+  for (const l of axisSettingsListeners) l()
+}
+
+export function subscribeAxisSettings(l: () => void): () => void {
+  axisSettingsListeners.add(l)
+  return () => { axisSettingsListeners.delete(l) }
+}
+
+/**
+ * Resolves the candle pane's Y-axis component from a klinecharts Chart instance.
+ */
+export function getCandleYAxis(chart: Chart | null): any {
+  // klinecharts 10: DrawPane dropped getAxisComponent — use getYAxes / getYAxisComponentById.
+  // Every hop is feature-detected so a rename degrades Y-zoom/reset instead of white-screening.
+  if (!chart) return null
+  try {
+    const anyChart = chart as any
+    if (typeof anyChart.getYAxes === 'function') {
+      const axes = anyChart.getYAxes({ paneId: 'candle_pane' }) as any[] | null | undefined
+      if (Array.isArray(axes) && axes.length > 0) {
+        const candle = axes.find(a => typeof a?.isInCandle === 'function' && a.isInCandle())
+        return candle ?? axes[0] ?? null
+      }
+    }
+    const pane = typeof anyChart.getDrawPaneById === 'function'
+      ? anyChart.getDrawPaneById('candle_pane')
+      : anyChart._candlePane
+    if (!pane) return null
+    if (typeof pane.getYAxisComponentById === 'function') {
+      return pane.getYAxisComponentById() ?? null
+    }
+    if (typeof pane.getYAxisComponents === 'function') {
+      const list = pane.getYAxisComponents()
+      return (Array.isArray(list) ? list[0] : null) ?? null
+    }
+    // klinecharts 9.x fallback
+    if (typeof pane.getAxisComponent === 'function') return pane.getAxisComponent() ?? null
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** Set the candle Y-axis auto-calc flag; false when the internal API is missing. */
+export function setCandleYAxisAutoCalc(chart: Chart | null, flag: boolean): boolean {
+  const yAxis = getCandleYAxis(chart)
+  if (yAxis === null || typeof yAxis.setAutoCalcTickFlag !== 'function') return false
+  try { yAxis.setAutoCalcTickFlag(flag); return true } catch { return false }
+}
+
+/** Read the candle Y-axis auto-calc flag; null when unknown. */
+export function getCandleYAxisAutoCalc(chart: Chart | null): boolean | null {
+  const yAxis = getCandleYAxis(chart)
+  if (yAxis === null || typeof yAxis.getAutoCalcTickFlag !== 'function') return null
+  try { return Boolean(yAxis.getAutoCalcTickFlag()) } catch { return null }
+}
+
+/** Ask the chart to re-layout its panes (internal); silently no-ops if absent. */
+export function adjustChartViewport(chart: Chart | null): void {
+  if (!chart) return
+  try {
+    const anyChart = chart as any
+    // klinecharts 10: adjustPaneViewport removed; updatePane(Main) refreshes after Y reset.
+    if (typeof anyChart.updatePane === 'function') {
+      anyChart.updatePane(0 /* UpdateLevel.Main */, 'candle_pane')
+      return
+    }
+    if (typeof anyChart.adjustPaneViewport === 'function') {
+      anyChart.adjustPaneViewport(false, true, true, true, true)
+      return
+    }
+    if (typeof anyChart.resize === 'function') anyChart.resize()
+  } catch { /* degrade */ }
+}
+
+/**
+ * Resets the candle pane Y-axis to auto calculation and refreshes the viewport.
+ */
+export function resetCandleYAxisAuto(chart: Chart | null): void {
+  if (!chart) return
+  // klinecharts 10 only rebuilds Y range in layout/resize when autoCalc is already
+  // true; updatePane alone redraws with the frozen range. Match 「自动」: flag then resize.
+  setCandleYAxisAutoCalc(chart, true)
+  if (typeof (chart as { resize?: () => void }).resize === 'function') chart.resize()
+  else adjustChartViewport(chart)
+}
+
+/**
+ * Sub-pane height that leaves `candleMin` px for the candle pane inside `totalHeight`.
+ * klinecharts gives leftover height to the candle pane; tall Pro chrome + many
+ * sub-panes can leave it near 0 → squashed bars / no Y ticks (price mark stuck at top).
+ */
+export function planSubPaneHeight(
+  totalHeight: number,
+  subPaneCount: number,
+  candleMin = CANDLE_PANE_MIN,
+  preferred = PANE_HEIGHT,
+): number {
+  if (subPaneCount <= 0) return preferred
+  if (!(totalHeight > 0)) return preferred
+  const budget = Math.max(0, totalHeight - candleMin)
+  return Math.max(40, Math.min(preferred, Math.floor(budget / subPaneCount)))
+}
+
+/**
+ * After layout/drawBar width changes: shrink competing sub-panes, restore Y auto, resize.
+ * Order matches 「自动」: setAutoCalc(true) BEFORE resize so forceBuildYAxisTick recreates range
+ * (resize-then-updatePane left a frozen empty range — blank candles until the button).
+ */
+export function healCandleViewport(chart: Chart | null, autoScaleCandle = true): void {
+  if (!chart) return
+  try {
+    if (autoScaleCandle) setCandleYAxisAutoCalc(chart, true)
+    const total = chart.getSize()?.height ?? 0
+    const panes = chart.getPaneOptions()
+    const list = Array.isArray(panes) ? panes : (panes ? [panes] : [])
+    const subIds = list
+      .map((p: { id?: string } | null) => p?.id)
+      .filter((id): id is string => typeof id === 'string' && id !== 'candle_pane' && id !== 'x_axis_pane' && !id.startsWith('separator_'))
+    if (subIds.length > 0 && total > 0) {
+      const h = planSubPaneHeight(total, subIds.length)
+      for (const id of subIds) {
+        try { chart.setPaneOptions({ id, height: h }) } catch { /* pane gone */ }
+      }
+    }
+    if (typeof chart.resize === 'function') chart.resize()
+    else if (autoScaleCandle) adjustChartViewport(chart)
+  } catch { /* degrade */ }
+}
+
+/** Same restore as the 「↺ 自动」 button: heal Y auto + persist autoScale.candle. */
+export function restoreCandleViewportLikeAutoButton(chart: Chart | null): void {
+  healCandleViewport(chart, true)
+  const cur = getAxisSettings()
+  if (!cur.autoScale.candle) {
+    setAxisSettings({ ...cur, autoScale: { ...cur.autoScale, candle: true } })
+  }
+}
+
+/** Legend cog on the editable indicators; a click opens the param row (ActionType.OnTooltipIconClick). */
+const GEAR = tooltipFeatureIcon('params', '⚙')
+
+/** 折叠十字线浮窗里的指标行，只留 时间/开高低收，点一下在“收起/展开”之间切换。 */
+/** Enabled VB alerts on the latest closed bar (second to last; last is forming). */
+export function vbAlertEvents(candles: readonly { time: string; high: number; low: number; close: number }[], params: readonly number[]): { id: string; text: string }[] {
+  if (candles.length < 2) return []
+  const rows = calculateVbProRead(candles, params)
+  const i = candles.length - 2
+  return enabledVbAlerts(rows[i], params).map(a => ({ id: `${candles[i]!.time}|${a.key}`, text: `${a.cn} · ${a.msg} (${candles[i]!.time})` }))
+}
+
+export const FOLD_EXEMPT: ReadonlySet<string> = new Set(["VB_PRO_READ"])
+
+const FOLD = tooltipFeatureIcon('fold', '▤')
+
+let registered = false
+
+
+export { matchDerivativeHistory } from './market-client.js'
+
+/** Candle spacing from the first two bars; undefined when it cannot be read. */
+export function inferIntervalMs(kLineDataList: { timestamp?: number }[]): number | undefined {
+  const a = kLineDataList[0]?.timestamp
+  const b = kLineDataList[1]?.timestamp
+  return a !== undefined && b !== undefined && b > a ? b - a : undefined
+}
+
+export type OiPostureRow = {
+  oi?: number
+  oiMa?: number
+  deltaOi?: number
+  bar?: PanelDerivativeBar
+}
+
+/** OI_POSTURE subplot series: coin OI + MA. Ratios live in the tooltip and top strip. */
+export function calcOiPostureRows(
+  kLineDataList: { timestamp?: number }[],
+  history: PanelDerivativeBar[],
+  maPeriod = 14,
+): OiPostureRow[] {
+  if (!Array.isArray(history) || history.length === 0) {
+    return kLineDataList.map(() => ({}))
+  }
+  const deltas = history.map((h, idx) => {
+    const prev = idx > 0 ? history[idx - 1] : undefined
+    const curVal = contractOpenInterest(h)
+    const prevVal = prev ? contractOpenInterest(prev) : null
+    return curVal !== null && prevVal !== null ? curVal - prevVal : undefined
+  })
+  const oiValues: (number | undefined)[] = []
+  return kLineDataList.map(k => {
+    const ts = k.timestamp
+    if (ts === undefined) {
+      oiValues.push(undefined)
+      return {}
+    }
+    const bar = matchDerivativeHistory(history, ts, inferIntervalMs(kLineDataList))
+    if (!bar) {
+      oiValues.push(undefined)
+      return {}
+    }
+    const histIdx = history.indexOf(bar)
+    const oi = contractOpenInterest(bar)
+    if (oi === null) {
+      oiValues.push(undefined)
+      return {}
+    }
+    oiValues.push(oi)
+    let sum = 0
+    let count = 0
+    for (let j = oiValues.length - 1; j >= 0 && count < maPeriod; j--) {
+      const val = oiValues[j]
+      if (val !== undefined) {
+        sum += val
+        count++
+      }
+    }
+    const row: OiPostureRow = { oi, bar }
+    if (count > 0) row.oiMa = sum / count
+    const delta = deltas[histIdx]
+    if (delta !== undefined) row.deltaOi = delta
+    return row
+  })
+}
+
+const DERIV_HISTORY_INDICATORS = new Set(['OI_POSTURE', 'REVPOINT'])
+
+
+/** Distinct, non-gray subplot palette (works on dark + light; up/down match candles). */
+export const SUBPLOT_COLORS = {
+  up: '#3ddc97', upFade: '#1f7a55', down: '#f47067', downFade: '#8f3f3a',
+  blue: '#58a6ff', orange: '#ffa726', purple: '#b083f0', yellow: '#e3b341', cyan: '#27C6DA',
+} as const
+
+/** TradingView-style 4-shade MACD histogram: bright when growing away from 0, dim when fading. */
+export function macdHistColor(cur: number | undefined, prev: number | undefined): string {
+  if (cur === undefined || !Number.isFinite(cur)) return SUBPLOT_COLORS.upFade
+  const growing = prev === undefined || !Number.isFinite(prev) || Math.abs(cur) >= Math.abs(prev)
+  if (cur >= 0) return growing ? SUBPLOT_COLORS.up : SUBPLOT_COLORS.upFade
+  return growing ? SUBPLOT_COLORS.down : SUBPLOT_COLORS.downFade
+}
+
+type HistNeighbor = { hist?: number }
+/** klinecharts 10.x: styles receives { data, indicator, barSpace }; data.current IS the calc row. */
+export function macdHistStyles(params: { data?: { prev?: HistNeighbor | null; current?: HistNeighbor | null }; prev?: HistNeighbor | null; current?: HistNeighbor | null }): Record<string, unknown> {
+  const data = params.data ?? params
+  const color = macdHistColor(data.current?.hist, data.prev?.hist)
+  return { color, borderColor: color, style: 'fill' }
+}
+
+function ensureRegistered(): void {
+  if (registered) return
+  registered = true
+  // Data rides extendData, not calcParams: klinecharts prints calcParams into
+  // the pane's tooltip title, which would render as "[object Object]" spam.
+  const passthrough = (_dl: unknown[], ind: { extendData: unknown }): unknown[] =>
+    ind.extendData as unknown[]
+  const line = (key: string, title: string, color: string, size = 1.5): { key: string; title: string; type: string; styles: () => Record<string, unknown> } =>
+    ({ key, title: `${title}: `, type: 'line', styles: () => ({ color, size }) })
+  const defs: { name: string; shortName: string; calcParams: number[]; precision?: number; figures: { key: string; title: string; type: string; baseValue?: number; styles?: unknown }[] }[] = [
+    { name: 'TM_RSI', shortName: 'RSI', calcParams: [14], figures: [line('rsi', 'RSI', SUBPLOT_COLORS.purple)] },
+    { name: 'TM_STOCH', shortName: 'STOCH', calcParams: [14, 3, 3], figures: [line('k', 'K', SUBPLOT_COLORS.blue), line('d', 'D', SUBPLOT_COLORS.orange)] },
+    { name: 'TM_ADX', shortName: 'ADX', calcParams: [14], figures: [line('adx', 'ADX', SUBPLOT_COLORS.yellow, 2), line('pdi', '+DI', SUBPLOT_COLORS.up), line('mdi', '-DI', SUBPLOT_COLORS.down)] },
+    { name: 'TM_MACD', shortName: 'MACD', calcParams: [12, 26, 9], precision: 4, figures: [{ key: 'hist', title: '柱: ', type: 'bar', baseValue: 0, styles: macdHistStyles }, line('macd', 'MACD', SUBPLOT_COLORS.blue), line('signal', '信号', SUBPLOT_COLORS.orange)] },
+    { name: 'TM_MFI', shortName: 'MFI', calcParams: [14], figures: [line('mfi', 'MFI', SUBPLOT_COLORS.cyan)] },
+    { name: 'TM_BB', shortName: '布林', calcParams: [20, 2], figures: [line('upper', '上', SUBPLOT_COLORS.down, 1), line('middle', '中', SUBPLOT_COLORS.yellow, 1), line('lower', '下', SUBPLOT_COLORS.up, 1)] },
+  ]
+  for (const def of defs) {
+    registerIndicator({ ...def, calc: passthrough } as never)
+  }
+
+  // klinecharts ships MA/EMA/SMA but no WMA. Empty shortName so the legend reads
+  // "WMA(60) x  WMA(100) y  WMA(200) z"; colours sampled from the reference shot.
+  const wmaFigures = (params: number[]): { key: string; title: string; type: string }[] =>
+    params.map((p, i) => ({ key: `wma${i}`, title: `WMA(${p}) `, type: 'line' }))
+  registerIndicator({
+    name: 'WMA',
+    shortName: '',
+    series: 'price',
+    shouldOhlc: true,
+    calcParams: WMA_PERIODS,
+    figures: wmaFigures(WMA_PERIODS),
+    regenerateFigures: wmaFigures,
+    styles: { lines: WMA_COLORS.map(color => ({ color, size: 1, style: 'solid', smooth: false, dashedValue: [2, 2] })) },
+    calc: (dataList: { close: number }[], ind: { calcParams: number[] }) => {
+      const closes = dataList.map(k => k.close)
+      return closes.map((_c, i) =>
+        Object.fromEntries(ind.calcParams.flatMap((p, j) => {
+          const v = wmaAt(closes, i, p)
+          return v === undefined ? [] : [[`wma${j}`, v]]
+        })))
+    },
+    createTooltipDataSource: () => tooltipOf({ features: [GEAR] }),
+  } as never)
+
+  registerIndicator({
+    name: 'SUPERTREND',
+    shortName: '超级趋势',
+    series: 'price',
+    calcParams: [60, 4],
+    figures: [{ key: 'up', type: 'line' }, { key: 'dn', type: 'line' }],
+    styles: { lines: ST_COLORS.map(color => ({ color, size: 1, style: 'solid', smooth: false, dashedValue: [2, 2] })) },
+    calc: (dataList: { high: number; low: number; close: number }[], ind: { calcParams: number[] }) =>
+      supertrend(dataList, ind.calcParams[0]!, ind.calcParams[1]!),
+    // One value coloured by side, params spaced "(60, 4)" like the reference shot.
+    createTooltipDataSource: ({ indicator, crosshair }: {
+      indicator: { calcParams: number[]; result: { up?: number; dn?: number }[] }
+      crosshair: { dataIndex?: number }
+    }) => {
+      const row = indicator.result[crosshair.dataIndex ?? indicator.result.length - 1]
+      const v = row?.up ?? row?.dn
+      return tooltipOf({
+        calcParamsText: `(${indicator.calcParams.join(', ')})`,
+        legends: v === undefined ? [] : [{ title: '', value: { text: formatPrice(v), color: ST_COLORS[row?.up !== undefined ? 0 : 1]! } }],
+        features: [GEAR],
+      })
+    },
+  } as never)
+
+  registerIndicator({
+    name: 'OI_POSTURE',
+    shortName: '合约OI',
+    series: 'volume',
+    precision: 2,
+    shouldFormatBigNumber: true,
+    calcParams: [14],
+    figures: [
+      {
+        key: 'oi',
+        title: '币数: ',
+        type: 'line',
+        styles: () => ({
+          color: '#27C6DA',
+          size: 1.5,
+        }),
+      },
+      {
+        key: 'oiMa',
+        title: 'OI均线: ',
+        type: 'line',
+        styles: () => ({
+          color: '#f59e0b',
+          size: 1,
+        }),
+      },
+    ],
+    calc: (kLineDataList: { timestamp?: number }[], indicator: { extendData?: unknown; calcParams?: number[] }) => {
+      const history = (indicator.extendData ?? []) as PanelDerivativeBar[]
+      const maPeriod = (indicator.calcParams?.[0] as number | undefined) ?? 14
+      return calcOiPostureRows(kLineDataList, history, maPeriod)
+    },
+    createTooltipDataSource: ({ chart, indicator, crosshair }: {
+      chart: { getDataList: () => { timestamp?: number }[] }
+      indicator: { calcParams?: number[]; extendData?: unknown; result?: Record<string, unknown>[] }
+      crosshair: { dataIndex?: number; kLineData?: { timestamp?: number } }
+    }) => {
+      const kLineDataList = chart.getDataList()
+      const res = indicator.result ?? []
+      const history = (indicator.extendData ?? []) as PanelDerivativeBar[]
+      if (!Array.isArray(history) || history.length === 0) {
+        return { name: '合约OI', calcParamsText: '', legends: [], features: [] }
+      }
+      const dataIndex = crosshair.dataIndex ?? (kLineDataList.length - 1)
+      const row = res[dataIndex] as OiPostureRow | undefined
+      const ts = crosshair.kLineData?.timestamp ?? kLineDataList[dataIndex]?.timestamp
+
+      let target: PanelDerivativeBar | undefined = row?.bar
+      let deltaVal: number | undefined = row?.deltaOi
+      if (!target && ts !== undefined) {
+        target = matchDerivativeHistory(history, ts, inferIntervalMs(kLineDataList))
+      }
+      // Strictly prevent time-travel leakage: only fallback to latest live snapshot on the newest candle
+      if (!target && dataIndex >= kLineDataList.length - 1) {
+        target = history[history.length - 1]
+      }
+
+      if (!target) {
+        return {
+          name: '合约OI',
+          calcParamsText: '',
+          legends: [
+            { title: '币数: ', value: { text: '—', color: '#8b949e' } },
+            { title: '动向: ', value: { text: '历史无快照', color: '#8b949e' } },
+          ],
+        features: [],
+        }
+      }
+
+      const postureText = target.quadrant
+        ? `${target.quadrant}${target.quadrantNote ? `（${target.quadrantNote}）` : ''}`
+        : target.posture
+      const pColor = postureColor(postureText).color
+      const oiContracts = contractOpenInterest(target)
+      const oiText = oiContracts !== null ? compact.format(oiContracts) : '—'
+      const lsrText = target.longShortRatio != null ? target.longShortRatio.toFixed(2) : '—'
+      const topPos = target.topPositionRatio != null ? target.topPositionRatio.toFixed(2) : null
+      const tkText = target.takerBuySellRatio != null ? target.takerBuySellRatio.toFixed(2) : null
+      const deltaText = deltaVal !== undefined && Number.isFinite(deltaVal)
+        ? `${deltaVal >= 0 ? '+' : ''}${compact.format(deltaVal)}`
+        : null
+
+      const legends: { title: string; value: { text: string; color: string } }[] = [
+        { title: '币数: ', value: { text: oiText, color: '#27C6DA' } },
+        { title: 'OI名义: ', value: { text: target.openInterestValue ? formatUsdtCnLocal(target.openInterestValue) : '—', color: '#8b949e' } },
+      ]
+      if (row?.oiMa !== undefined && Number.isFinite(row.oiMa)) {
+        legends.push({ title: 'OI均线: ', value: { text: compact.format(row.oiMa), color: '#f59e0b' } })
+      }
+      if (deltaText) {
+        legends.push({ title: 'Δ币数: ', value: { text: deltaText, color: deltaVal! >= 0 ? '#22c55e' : '#ef4444' } })
+      }
+      legends.push({ title: '动向: ', value: { text: postureText ?? '—', color: pColor } })
+      if (tkText) {
+        legends.push({ title: '主动买卖: ', value: { text: tkText, color: Number(tkText) >= 1.0 ? '#22c55e' : '#ef4444' } })
+      }
+      legends.push({ title: '账户人数比: ', value: { text: lsrText, color: '#c9d1d9' } })
+      if (topPos) {
+        legends.push({ title: '大户持仓比: ', value: { text: topPos, color: '#ffa726' } })
+      }
+      const p = indicator.calcParams?.[0] ?? 14
+      return {
+        name: '合约OI',
+        calcParamsText: `(${p})`,
+        legends,
+        features: [],
+      }
+    },
+  } as never)
+
+  registerIndicator(evasiveSuperTrendIndicator as never)
+  registerIndicator(nadarayaWatsonIndicator as never)
+  registerIndicator(orderBlockIndicator as never)
+  registerIndicator(vbProReadIndicator as never)
+  registerIndicator(dualViewHtfIndicator as never)
+  registerIndicator(mtfSRIndicator as never)
+  registerIndicator(entrySignalIndicator as never)
+  registerIndicator(cvdFlowIndicator as never)
+  registerIndicator(rsiGridIndicator as never)
+  registerIndicator(rsiGridCumIndicator as never)
+  registerIndicator(rsiGridMarksIndicator as never)
+  registerIndicator(revPointIndicator as never)
+registerIndicator(kPatternIndicator as never)
+registerIndicator(aicoinTdIndicator as never)
+registerIndicator(aicoinTdMarksIndicator as never)
+  registerIndicator(volTierIndicator as never)
+  registerIndicator({ ...volTierIndicator, name: 'VOL' } as never)
+  // Overlay shapes for the draw primitives. extendData: { color, dashed, label }.
+  // Register exactly the callbacks exercised by the overlay regression tests.
+  for (const overlay of createAnnotationOverlays(FONT_FAMILY, (text, style) =>
+    utils.calcTextWidth(text, style.size, style.weight, style.family))) {
+    registerOverlay(overlay)
+  }
+  // Pro DrawingBar extras (polygon / wave / fib variants) — Apache-2.0 from @klinecharts/pro.
+  registerProOverlays()
+}
+
+export function useDark(): boolean {
+  const [dark, setDark] = useState(() =>
+    typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches)
+  useEffect(() => {
+    const media = matchMedia('(prefers-color-scheme: dark)')
+    const onChange = (e: MediaQueryListEvent): void => setDark(e.matches)
+    media.addEventListener('change', onChange)
+    return () => media.removeEventListener('change', onChange)
+  }, [])
+  return dark
+}
+
+/**
+ * When the crosshair is on the left half, klinecharts parks the fixed OHLC box
+ * at the top-right — exactly where RevPoint's status table is pinned. Push the
+ * right-parked box left of the table (statusTableRect geometry).
+ */
+export function ohlcTooltipAvoidTable(revPointOn: boolean, paneW = 0): Record<string, unknown> {
+  // Table + edge pills own the top-right: park the OHLC box top-left on both halves.
+  return { candle: { tooltip: { rect: { offsetRight: revPointOn && paneW > 0 ? ohlcOffsetRightForTopLeft(paneW) : 4 } } } }
+}
+
+export function klineStyles(p: Palette, _coordType: CoordType = 'normal'): Record<string, unknown> {
+  const tick = { color: p.faint, family: FONT_FAMILY }
+  return {
+    grid: { horizontal: { color: p.line }, vertical: { color: p.line } },
+    candle: {
+      bar: {
+        upColor: p.up, downColor: p.down, noChangeColor: p.faint,
+        upBorderColor: p.up, downBorderColor: p.down, noChangeBorderColor: p.faint,
+        upWickColor: p.up, downWickColor: p.down, noChangeWickColor: p.faint,
+      },
+      priceMark: {
+        high: { color: p.faint },
+        low: { color: p.faint },
+        last: { upColor: p.up, downColor: p.down, noChangeColor: p.faint },
+      },
+      tooltip: {
+        showType: 'rect',
+        legend: { color: p.text, family: FONT_FAMILY },
+        title: { color: p.text, family: FONT_FAMILY },
+        features: [FOLD],
+        rect: {
+          position: 'fixed',
+          paddingLeft: 6, paddingRight: 6, paddingTop: 4, paddingBottom: 4,
+          offsetLeft: 4, offsetTop: 4, offsetRight: 4, offsetBottom: 4,
+          borderRadius: 4, borderSize: 1,
+          borderColor: p.line,
+          color: p.text === '#c9d1d9' ? 'rgba(22,27,34,0.92)' : 'rgba(255,255,255,0.92)',
+        },
+      },
+    },
+    indicator: {
+      tooltip: {
+        ...SUBPLOT_TOOLTIP,
+        legend: { color: p.text, family: FONT_FAMILY, defaultValue: '—' },
+        title: { color: p.text, family: FONT_FAMILY, showName: true, showParams: true },
+      },
+    },
+    xAxis: { axisLine: { color: p.line }, tickText: tick, tickLine: { color: p.line } },
+    yAxis: { axisLine: { color: p.line }, tickText: tick, tickLine: { color: p.line } },
+    separator: { color: p.line },
+    crosshair: {
+      horizontal: { line: { color: p.faint }, text: { backgroundColor: p.faint, family: FONT_FAMILY } },
+      vertical: { line: { color: p.faint }, text: { backgroundColor: p.faint, family: FONT_FAMILY } },
+    },
+  }
+}
+
+/**
+ * Fill missing regime snapshot + per-bar series on a timeframe (live panel path).
+ * Agent cards already ship both; live `candlesToPayload` leaves them empty on
+ * purpose so the model is not blamed for client-invented numbers — the card
+ * still needs series for MACD/Stoch/ADX/MFI/BB chips, so we compute locally.
+ */
+// Candle and series arrays are immutable snapshots. Weak keys release all derived
+// data with the chart payload, instead of retaining every live tick in a Map.
+const snapshotCache = new WeakMap<ChartTimeframeData['candles'], NonNullable<ChartTimeframeData['indicators']>>()
+const regimeSeriesCache = new WeakMap<ChartTimeframeData['candles'], NonNullable<ChartTimeframeData['series']>>()
+const chipRowsCache = new WeakMap<NonNullable<ChartTimeframeData['series']>, Map<string, Record<string, number | undefined>[]>>()
+const mergedSeriesCache = new WeakMap<NonNullable<ChartTimeframeData['series']>, { candles: ChartTimeframeData['candles']; series: NonNullable<ChartTimeframeData['series']> }>()
+
+/**
+ * Columns the payload already carries win over the locally computed ones: a
+ * walkthrough section ships only its own pane's columns, null outside the
+ * window it read, and recomputing them over the whole chart would show numbers
+ * the model never read. Columns whose length no longer matches the candles are
+ * stale and ignored. The result is cached per series identity.
+ */
+function withOwnColumns(tf: ChartTimeframeData, local: NonNullable<ChartTimeframeData['series']>): NonNullable<ChartTimeframeData['series']> {
+  const own = tf.series
+  if (own === undefined) return local
+  const cached = mergedSeriesCache.get(own)
+  if (cached !== undefined && cached.candles === tf.candles) return cached.series
+  const aligned: NonNullable<ChartTimeframeData['series']> = {}
+  for (const [key, col] of Object.entries(own)) {
+    if (Array.isArray(col) && col.length === tf.candles.length) aligned[key] = col
+  }
+  const series = Object.keys(aligned).length === 0 ? local : { ...local, ...aligned }
+  mergedSeriesCache.set(own, { candles: tf.candles, series })
+  return series
+}
+
+export function enrichChartTimeframe(tf: ChartTimeframeData): ChartTimeframeData {
+  if (tf.candles.length === 0) return tf
+  const seriesOk = tf.series !== undefined
+    && tf.series['rsi14']?.length === tf.candles.length
+  if (tf.indicators !== null && seriesOk) return tf
+  try {
+    let indicators = tf.indicators ?? snapshotCache.get(tf.candles)
+    if (indicators === undefined) {
+      indicators = regimeSnapshot(tf.candles)
+      snapshotCache.set(tf.candles, indicators)
+    }
+    let local = seriesOk ? undefined : regimeSeriesCache.get(tf.candles)
+    if (!seriesOk && local === undefined) {
+      local = regimeSeries(tf.candles)
+      regimeSeriesCache.set(tf.candles, local)
+    }
+    return { ...tf, indicators, series: seriesOk ? tf.series! : withOwnColumns(tf, local!) }
+  } catch {
+    return tf
+  }
+}
+
+/** Map payload series onto klinecharts rows for one chip's figures. */
+export function seriesRows(data: ChartTimeframeData, figures: Record<string, string>): Record<string, number | undefined>[] {
+  const entries = Object.entries(figures)
+  const key = JSON.stringify([data.candles.length, entries])
+  let cache = data.series === undefined ? undefined : chipRowsCache.get(data.series)
+  const cached = cache?.get(key)
+  if (cached !== undefined) return cached
+  const rows = data.candles.map((_, i) => {
+    const row: Record<string, number | undefined> = {}
+    for (const [figKey, seriesKey] of entries) {
+      const v = data.series?.[seriesKey]?.[i]
+      row[figKey] = typeof v === 'number' && Number.isFinite(v) ? v : undefined
+    }
+    return row
+  })
+  if (data.series !== undefined) {
+    if (cache === undefined) { cache = new Map(); chipRowsCache.set(data.series, cache) }
+    // Only a handful of chip mappings are needed for one immutable series.
+    if (cache.size >= 32) cache.delete(cache.keys().next().value!)
+    cache.set(key, rows)
+  }
+  return rows
+}
+
+function hasSeries(data: ChartTimeframeData, figures: Record<string, string>): boolean {
+  const series = data.series
+  if (series === undefined) return false
+  return Object.values(figures).every((key) => {
+    const col = series[key]
+    return Array.isArray(col) && col.length === data.candles.length
+  })
+}
+
+type ChipDef = {
+  id: string
+  indicator?: { name: string; figures: Record<string, string>; overlay?: boolean; builtIn?: boolean }
+  label: (ind: Record<string, unknown>) => { text: string; state: unknown }
+}
+
+/** UI-only translation of the snapshot's state words; the model keeps reading the English originals. */
+const ZH_STATE: [RegExp, string][] = [
+  [/no seeded moving averages|no seeded wma/g, '均线未成形'], [/above upper band/g, '上轨之上'], [/below lower band/g, '下轨之下'],
+  [/inside bands/g, '带内'], [/developing trend/g, '趋势形成中'], [/no trend/g, '无趋势'], [/trending/g, '趋势中'],
+  [/overbought/g, '超买'], [/oversold/g, '超卖'], [/neutral/g, '中性'], [/bullish/g, '看多'], [/bearish/g, '看空'],
+  [/converging/g, '收敛'], [/flat/g, '走平'], [/support at/g, '支撑'], [/resistance at/g, '阻力'],
+  [/above/g, '站上'], [/below/g, '跌破'],
+]
+export function zhState(s: string): string {
+  return ZH_STATE.reduce((acc, [re, zh]) => acc.replace(re, zh), s)
+}
+
+const CHIP_DEFS: ChipDef[] = [
+  {
+    id: 'vol',
+    indicator: { name: 'VOL_TIER', figures: {}, builtIn: true },
+    label: ind => {
+      const v = ind['structure'] as Record<string, unknown> | undefined
+      const vr = v?.['volume'] as Record<string, unknown> | undefined
+      const ratio = vr?.['lastRatio']
+      return { text: `VOL${typeof ratio === 'number' ? ` ${ratio}×` : ''}`, state: typeof ratio === 'number' ? (ratio >= 2 ? '放量' : ratio <= 0.5 ? '缩量' : '正常') : '—' }
+    },
+  },
+  {
+    id: 'rsi',
+    // Same pane as the Pine script: RSI + 累计差值 as lines, 30/60 hlines,
+    // fill markers. Computed from the chart's own candles, so it tracks a
+    // live column instead of a frozen payload series.
+    indicator: { name: 'RSI_GRID', figures: {}, builtIn: true },
+    label: ind => {
+      const rg = ind['rsiGrid'] as Record<string, unknown> | undefined
+      if (!rg) return { text: 'RSI网格', state: '—' }
+      const sg = ind['rsiGridShort'] as Record<string, unknown> | undefined
+      const cum = fmt(get(rg, 'cum'))
+      const shortCum = get(sg, 'cum')
+      const rsiVal = fmt(get(rg, 'rsi'))
+      const params = get(rg, 'params')
+      const length = Array.isArray(params) ? params[0] : 7
+      const longState = rsiGridStateText({ ...rg, side: 'long' } as unknown as RsiGridReport)
+      const shortState = sg ? rsiGridStateText({ ...sg, side: 'short' } as unknown as RsiGridReport) : '—'
+      return { text: `RSI${length} ${rsiVal} · 多差 ${cum} / 空差 ${typeof shortCum === 'number' ? fmt(shortCum === 0 ? 0 : -shortCum) : '—'}`,
+        state: `多·${longState} / 空·${shortState}` }
+    },
+  },
+  { id: 'macd', indicator: { name: 'TM_MACD', figures: { hist: 'macd_hist', macd: 'macd', signal: 'macd_signal' } }, label: ind => ({ text: `MACD ${fmt(get(ind['macd'], 'histogram'))}`, state: get(ind['macd'], 'state') }) },
+  { id: 'stoch', indicator: { name: 'TM_STOCH', figures: { k: 'stoch_k', d: 'stoch_d' } }, label: ind => ({ text: `随机 ${fmt(get(ind['stochastic'], 'k'))}/${fmt(get(ind['stochastic'], 'd'))}`, state: get(ind['stochastic'], 'state') }) },
+  { id: 'adx', indicator: { name: 'TM_ADX', figures: { adx: 'adx', pdi: 'plus_di', mdi: 'minus_di' } }, label: ind => ({ text: `ADX ${fmt(get(ind['adx14'], 'value'))}`, state: get(ind['adx14'], 'state') }) },
+  { id: 'mfi', indicator: { name: 'TM_MFI', figures: { mfi: 'mfi14' } }, label: ind => ({ text: `MFI ${fmt(get(ind['mfi14'], 'value'))}`, state: get(ind['mfi14'], 'state') }) },
+  { id: 'bb', indicator: { name: 'TM_BB', figures: { upper: 'bb_upper', middle: 'bb_middle', lower: 'bb_lower' }, overlay: true }, label: ind => ({ text: '布林(20,2)', state: get(ind['bollinger20'], 'state') }) },
+  { id: 'ma', label: ind => ({ text: '均线位置', state: get(ind['movingAverages'], 'closeVs') }) },
+]
+
+/**
+ * The indicator a chip mounts. A walkthrough forces its own panes, and its 'rsi'
+ * means ONE line (rsi14) in its own pane — not the RSI_GRID pair that the
+ * reader's RSI chip stands for.
+ */
+export function chipIndicator(id: string, forced: boolean): ChipDef['indicator'] {
+  if (forced && id === 'rsi') return { name: 'TM_RSI', figures: { rsi: 'rsi14' } }
+  return CHIP_DEFS.find(d => d.id === id)?.indicator
+}
+
+/** Pane ids the ink layer aims at: volume plus each mounted chip pane, never the price pane. */
+export function lessonPaneIds(mounted: ReadonlyMap<string, string>, volumePane: string | undefined): PaneIds {
+  const out: PaneIds = {}
+  if (volumePane !== undefined) out.volume = volumePane
+  for (const [id, paneId] of mounted) {
+    if (paneId !== 'candle_pane') out[id] = paneId
+  }
+  return out
+}
+
+export function samePaneIds(a: PaneIds, b: PaneIds): boolean {
+  const ak = Object.keys(a)
+  if (ak.length !== Object.keys(b).length) return false
+  return ak.every(k => a[k] === b[k])
+}
+
+/** With the persistent column open a tool card collapses to a receipt the reader can expand. */
+export function cardView(columnOpen: boolean, expanded: boolean): 'chart' | 'receipt' {
+  return columnOpen && !expanded ? 'receipt' : 'chart'
+}
+
+export function chartReceipt(toolName: string, payload: ChartPayload): string {
+  const bars = payload.timeframes[0]?.candles.length ?? 0
+  const marks = payload.timeframes.reduce((n, t) => n + (t.annotations?.length ?? 0), 0)
+  const tfs = payload.timeframes.map(t => t.timeframe).join(' · ')
+  return [toolName, `${payload.symbol}${tfs === '' ? '' : ` ${tfs}`}`, `${bars} 根K线`, ...(marks > 0 ? [`${marks} 条标注`] : [])].join(' · ')
+}
+
+/** What the ink layer needs from a live canvas. */
+export interface KlineReady { chart: Chart; panes: PaneIds }
+
+const RECEIPT: CSSProperties = {
+  display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', fontSize: 12.5, lineHeight: '20px',
+  color: 'var(--dsw-alias-text-3, #8b949e)', margin: '2px 0',
+}
+const RECEIPT_BUTTON: CSSProperties = {
+  border: 0, background: 'none', padding: 0, font: 'inherit', color: 'inherit', cursor: 'pointer',
+  textDecoration: 'underline', textUnderlineOffset: 3,
+}
+
+/** Lanes available before a label is dropped rather than stacked. */
+const LABEL_LANES = 4
+
+/**
+ * Fraction of the visible price range under which two labels would collide.
+ * ~2.5% of the plot height at the label's 10px type size plus breathing room.
+ */
+const LABEL_MIN_GAP = 0.06
+
+/**
+ * Assign each horizontal line a label lane, or -1 to draw the line unlabelled.
+ *
+ * Ten levels inside a 5% band cannot all be captioned legibly next to their
+ * lines — something has to give, and a pile of overlapping text gives the
+ * reader nothing while claiming to give them everything. Lines that sit close
+ * together step sideways into free lanes; past the last lane the caption is
+ * dropped and the line stays. Nothing is lost: the full table, with prices and
+ * provenance, is in the chat beside this chart.
+ *
+ * Placement runs in price space against the window's own range, because the
+ * exact pixel scale is not known until the chart lays itself out — an
+ * approximation that is deterministic and far better than none.
+ *
+ * @param prices - line prices, in draw order.
+ * @param low - lowest price in the drawn window.
+ * @param high - highest price in the drawn window.
+ * @returns one lane per input price, aligned by index; -1 means no label.
+ */
+export function assignLabelLanes(prices: readonly number[], low: number, high: number, coordType: CoordType = 'normal'): number[] {
+  // On a log axis the screen distance is proportional to ln(price), so measure
+  // collisions there; non-positive prices cannot be placed on it → linear.
+  const useLog = coordType === 'log' && low > 0 && prices.every(p => p > 0)
+  const tx = useLog ? Math.log : (v: number) => v
+  const top = tx(high)
+  const span = top - tx(low)
+  const lanes = new Array<number>(prices.length).fill(0)
+  if (!Number.isFinite(span) || span <= 0) return lanes
+
+  // Sort by price descending so lanes fill the way the eye reads the axis.
+  const order = prices.map((price, index) => ({ price, index }))
+    .sort((a, b) => b.price - a.price)
+  // Last y-position placed in each lane, as a 0..1 fraction of the range.
+  // NEGATIVE infinity: an empty lane must accept the first label, and
+  // `y - (+Infinity)` is -Infinity, which clears no gap at all.
+  const occupied = new Array<number>(LABEL_LANES).fill(Number.NEGATIVE_INFINITY)
+
+  for (const { price, index } of order) {
+    const y = (top - tx(price)) / span
+    let placed = -1
+    for (let lane = 0; lane < LABEL_LANES; lane += 1) {
+      if (y - occupied[lane]! >= LABEL_MIN_GAP) {
+        occupied[lane] = y
+        placed = lane
+        break
+      }
+    }
+    lanes[index] = placed
+  }
+  return lanes
+}
+
+function drawPrimitive(chart: Pick<Chart, 'createOverlay'>, prim: DrawPrimitive, lane = 0): void {
+  if (prim.kind === 'hline') {
+    chart.createOverlay({
+      name: 'tm_hline', lock: true,
+      points: [{ value: prim.price }],
+      extendData: { color: prim.color, dashed: prim.dashed ?? false, label: prim.label ?? '', lane },
+    })
+  } else if (prim.kind === 'region') {
+    chart.createOverlay({
+      name: 'tm_region', lock: true,
+      points: [
+        { value: prim.low, ...prim.startTime !== undefined ? { timestamp: Date.parse(prim.startTime) } : {} },
+        { value: prim.high, ...prim.startTime !== undefined ? { timestamp: Date.parse(prim.startTime) } : {} },
+        ...prim.availableAt !== undefined ? [{ timestamp: Date.parse(prim.availableAt), value: prim.high }] : [],
+      ],
+      extendData: { color: prim.color, label: prim.label ?? '', lane,
+        anchored: prim.startTime !== undefined, knownAfterConfirmation: prim.availableAt !== undefined },
+    })
+  } else {
+    chart.createOverlay({
+      name: 'tm_polyline', lock: true,
+      points: prim.points.map(p => ({ timestamp: Date.parse(p.time), value: p.price })),
+      extendData: { color: prim.color, dashed: prim.dashed ?? false, label: prim.label ?? '',
+        ...prim.notes !== undefined ? { vertexNotes: prim.notes } : {} },
+    })
+  }
+}
+
+/**
+ * Right gutter (px) that keeps a projected path's future vertices on screen:
+ * bars between the last candle and the furthest vertex, plus a little air,
+ * capped so candles keep most of the pane. undefined = no future vertex.
+ */
+export function futureGutterPx(
+  primitives: readonly DrawPrimitive[], lastBarMs: number, barMs: number, barSpacePx: number, paneWidth: number,
+): number | undefined {
+  if (!(barMs > 0) || !(barSpacePx > 0) || !Number.isFinite(lastBarMs)) return undefined
+  let furthest = lastBarMs
+  for (const prim of primitives) {
+    if (prim.kind !== 'polyline') continue
+    for (const p of prim.points) {
+      const t = Date.parse(p.time)
+      if (Number.isFinite(t) && t > furthest) furthest = t
+    }
+  }
+  if (furthest <= lastBarMs) return undefined
+  const bars = Math.ceil((furthest - lastBarMs) / barMs) + 4
+  const cap = paneWidth > 0 ? paneWidth * 0.45 : Infinity
+  return Math.max(DEFAULT_RIGHT_GUTTER_PX, Math.min(bars * barSpacePx, cap))
+}
+
+/** klinecharts' own default right offset. */
+const DEFAULT_RIGHT_GUTTER_PX = 80
+
+/** One payload candle as a klinecharts row. */
+function toKLine(c: { time: string; open: number; high: number; low: number; close: number; volume: number }): KLineData {
+  return { timestamp: Date.parse(c.time), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }
+}
+
+/** Older-bar paging contract between the panel and the canvas. */
+export interface ChartHistory {
+  /** Fetch bars strictly older than `beforeMs`, ascending. */
+  load: (beforeMs: number) => Promise<ChartTimeframeData['candles']>
+  /** Merge the bars the canvas just prepended into the payload's series. */
+  commit: (older: ChartTimeframeData['candles']) => void
+  /** Optional: bars strictly newer than `afterMs` (DataLoader type=backward). */
+  loadNewer?: (afterMs: number) => Promise<ChartTimeframeData['candles']>
+  commitNewer?: (newer: ChartTimeframeData['candles']) => void
+}
+
+/**
+ * Diff the wanted chip set against what is mounted on the canvas.
+ * @param active - chip ids the user has on.
+ * @param mounted - chip ids currently on the canvas.
+ * @param mountable - whether a chip can be drawn right now (has series etc.).
+ */
+export function planChipSync(active: readonly string[], mounted: ReadonlyMap<string, string> | ReadonlySet<string>, mountable: (id: string) => boolean): { add: string[]; remove: string[] } {
+  const want = new Set(active.filter(mountable))
+  const have = new Set(mounted.keys())
+  return { add: [...want].filter(id => !have.has(id)), remove: [...have].filter(id => !want.has(id)) }
+}
+
+function Kline({ data, scenarios, dark, active, seriesKey, marksKey, settings, axisSettings, onEditParams, derivatives, cvd, largeWalls, wallMarket = 'all', onCrosshairHover, history, baseHeight = CHART_HEIGHT, fill = false, onChartReady, drawBarOpen = true, forced = false, overlay }: {
+  data: ChartTimeframeData
+  /** True when a walkthrough names the panes (see {@link chipIndicator}). */
+  forced?: boolean
+  /** Ink drawn over the canvas, inside the same box as the chart (right of the drawing bar). */
+  overlay?: ((ready: KlineReady) => ReactNode) | undefined
+  /** Older-bar paging for klinecharts loadMore; absent on agent cards. */
+  history?: ChartHistory | undefined
+  settings: IndicatorSettings
+  axisSettings: AxisSettings
+  onEditParams: () => void
+  derivatives?: PanelDerivatives | null | undefined
+  /** Perp/spot taker delta per bar for CVD_FLOW; panel only. */
+  cvd?: PanelCvdBar[] | null | undefined
+  largeWalls?: PanelLargeOrders | null | undefined
+  /** Same pill as the wall strip. The overlay must use it or 现货 still draws 合约 lines. */
+  wallMarket?: WallMarketFilter
+  onCrosshairHover?: ((timestamp: number | null) => void) | undefined
+  scenarios: ChartScenario[]
+  dark: boolean
+  active: string[]
+  /**
+   * Identity of the SERIES being drawn — symbol, timeframe, and anything else
+   * that means "a different chart". The plot is rebuilt when this changes and
+   * only then; a live tail update keeps the same key and rides
+   * {@link Chart.updateData} instead, so a polling panel does not tear the
+   * canvas down twice a second.
+   */
+  seriesKey: string
+  /**
+   * Identity of the agent marks & scenarios. Updated independently of the chart
+   * instance so new annotations redraw overlays without tearing the canvas down.
+   */
+  marksKey: string
+  baseHeight?: number
+  /** Take the height the parent flex column leaves, instead of a fixed plot height. */
+  fill?: boolean
+  /** Expose the live chart instance to ChartBody chrome (screenshot / timezone / styles). */
+  onChartReady?: ((chart: Chart | null) => void) | undefined
+  /** When false, hide Pro DrawingBar and give the canvas full width. */
+  drawBarOpen?: boolean
+}): JSX.Element {
+  const el = useRef<HTMLDivElement>(null)
+  // klinecharts 9.8 keys its instance cache on the container's DOM id and
+  // falls back to '' when there is none, so every id-less chart on the page
+  // shares one slot: init() then hands back a chart whose container was
+  // already unmounted. One id per mount.
+  const chartDomId = useRef(`dsh-kline-${++chartDomSeq}`)
+  const chartRef = useRef<Chart | null>(null)
+  const [chartReady, setChartReady] = useState(0)
+  const [lessonPanes, setLessonPanes] = useState<PaneIds>({})
+  /** Live-bar sink from DataLoader.subscribeBar (klinecharts 10). */
+  const barSubscribeRef = useRef<BarSubscriber>(null)
+  const ohlcParkCleanup = useRef<(() => void) | null>(null)
+  const latest = useRef(data)
+  latest.current = data
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
+  const derivativesRef = useRef(derivatives)
+  derivativesRef.current = derivatives
+  const cvdRef = useRef(cvd)
+  cvdRef.current = cvd
+  const onEditRef = useRef(onEditParams)
+  onEditRef.current = onEditParams
+  const onHoverRef = useRef(onCrosshairHover)
+  onHoverRef.current = onCrosshairHover
+  const onChartReadyRef = useRef(onChartReady)
+  onChartReadyRef.current = onChartReady
+  const wallOverlayIds = useRef<string[]>([])
+  // 大额成交 dots currently drawn, for the hover tooltip.
+  const tradeDotsRef = useRef<{ t: PanelLargeTrade; r: number }[]>([])
+  const [tradeTip, setTradeTip] = useState<{ left: number; top: number; flipX: boolean; flipY: boolean; key: string; tz?: string; rows: PanelLargeTrade[] } | null>(null)
+  const annotationOverlayIds = useRef<string[]>([])
+  const futureGutterSet = useRef(false)
+  /** Chip indicators currently mounted on the canvas: chip id → pane id. */
+  const mountedChips = useRef(new Map<string, string>())
+  const historyRef = useRef(history)
+  historyRef.current = history
+  // 默认只收起主图指标行，副图名称和数值保持可见。
+  const foldRef = useRef(true)
+  const paneCount = active.filter(id => id !== 'vol' && CHIP_DEFS.find(d => d.id === id)?.indicator?.overlay !== true).length
+    + EDITABLE.filter(d => d.pane !== undefined && settings[d.name]?.visible && (d.name !== 'AICOIN_TD' || tdWantsPane(settings[d.name]!.params))).length
+    // RSI_GRID also mounts the 累计差值 pane under it.
+    + (settings['RSI_GRID']?.visible ? 1 : 0)
+
+  useEffect(() => {
+    const container = el.current
+    if (container === null) return
+    container.id = chartDomId.current
+    ensureRegistered()
+    const palette = dark ? DARK : LIGHT
+    const chart = init(container, {
+      locale: 'zh-CN',
+      timezone: 'Asia/Tokyo',
+      layout: {
+        pane: { height: PANE_HEIGHT, minHeight: 40 },
+        yAxis: { position: 'right', inside: false, scrollZoomEnabled: true },
+      },
+    })
+    if (chart === null) return
+    chartRef.current = chart
+    onChartReadyRef.current?.(chart)
+    setChartReady(n => n + 1)
+    const applyFold = createMainPaneTooltipFold(chart, FOLD_EXEMPT)
+    const data = latest.current
+    // Named themes for toolbar switch (registerStyles); initial paint still uses object styles.
+    ensureChartThemes({
+      dark: klineStyles(DARK, axisSettings.coordType) as never,
+      light: klineStyles(LIGHT, axisSettings.coordType) as never,
+    })
+    chart.setStyles(klineStyles(palette, axisSettings.coordType))
+    applyDisplayToChart(chart, getDisplaySettings())
+    const applyOhlcPark = () => chart.setStyles(ohlcTooltipAvoidTable(settingsRef.current['REVPOINT']?.visible ?? false, chart.getSize('candle_pane', 'main' as never)?.width ?? 0))
+    applyOhlcPark()
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(applyOhlcPark) : null
+    ro?.observe(container)
+    ohlcParkCleanup.current = () => ro?.disconnect()
+    const candleGap = axisSettings.autoScale.candle ? { top: 0.08, bottom: 0.05 } : { top: 0.2, bottom: 0.1 }
+    chart.overrideYAxis({
+      paneId: 'candle_pane',
+      name: yAxisNameForCoord(axisSettings.coordType),
+      scrollZoomEnabled: true,
+      gap: candleGap,
+    })
+    const pricePrec = detectPricePrecision(data.candles)
+    chart.setSymbol({ ticker: seriesKey.split('|')[1] ?? seriesKey, pricePrecision: pricePrec, volumePrecision: 0 })
+    chart.setPeriod(periodFromTimeframe(data.timeframe))
+    const loaderOpts: Parameters<typeof createCandleDataLoader>[0] = {
+      getCandles: () => latest.current.candles,
+      onSubscribe: (cb) => { barSubscribeRef.current = cb },
+    }
+    if (historyRef.current) {
+      loaderOpts.loadOlder = (beforeMs) => historyRef.current!.load(beforeMs)
+      loaderOpts.commitOlder = (rows) => { historyRef.current?.commit(rows as typeof latest.current.candles) }
+      if (historyRef.current.loadNewer) {
+        loaderOpts.loadNewer = (afterMs) => historyRef.current!.loadNewer!(afterMs)
+        loaderOpts.commitNewer = (rows) => { historyRef.current?.commitNewer?.(rows as typeof latest.current.candles) }
+      }
+    }
+    chart.setDataLoader(createCandleDataLoader(loaderOpts))
+    for (const def of EDITABLE) {
+      if (def.name === 'LARGE_WALLS') continue // overlay drawn from CoinGlass RPC, not a klinecharts indicator
+      const s = settingsRef.current[def.name]!
+      const ext = DERIV_HISTORY_INDICATORS.has(def.name) ? derivativesRef.current?.history
+        : def.name === 'MTF_SR' || def.name === 'DUAL_VIEW_HTF' ? { sourceTimeframe: data.timeframe, sourceTimeframeSeconds: mtfSourceTimeframeSeconds(data.timeframe) }
+        : def.name === 'AICOIN_KPATTERN' ? kpThemeExt(dark, settingsRef.current)
+        : def.name === 'VOL_TIER' ? { dark }
+        : def.name === 'CVD_FLOW' ? (cvdRef.current ?? undefined) : undefined
+      if (def.name === 'AICOIN_TD') { syncAicoinTd(chart, s, dark); continue }
+      if (def.pane !== undefined) {
+        // Own pane: created only when shown, so a hidden one doesn't leave a blank strip.
+        if (s.visible) {
+          createIndicatorInPane(chart, { name: def.name, calcParams: s.params, extendData: ext }, { paneId: def.pane, height: PANE_HEIGHT })
+          chart.overrideYAxis({ paneId: def.pane, gap: { top: 0.24, bottom: 0.10 } })
+          if (def.name === 'RSI_GRID') {
+            createIndicatorInPane(chart, { name: 'RSI_GRID_CUM', calcParams: s.params }, { paneId: 'pane_rsi_cum', height: PANE_HEIGHT })
+            chart.overrideYAxis({ paneId: 'pane_rsi_cum', gap: { top: 0.24, bottom: 0.10 } })
+            createIndicatorInPane(chart, { name: 'RSI_GRID_MARKS', calcParams: s.params }, { paneId: 'candle_pane', isStack: true })
+          }
+        }
+        continue
+      }
+      syncIndicatorInPane(chart, { name: def.name, calcParams: s.params, extendData: ext }, s.visible, { paneId: 'candle_pane', isStack: true })
+    }
+    const onFeatureClick = (data: unknown) => {
+      const d = data as { feature?: { id?: string } } | undefined
+      if (d?.feature?.id === GEAR.id) onEditRef.current()
+      if (d?.feature?.id === FOLD.id) {
+        foldRef.current = !foldRef.current
+        applyFold(foldRef.current)
+      }
+    }
+    chart.subscribeAction('onCandleTooltipFeatureClick', onFeatureClick)
+    chart.subscribeAction('onIndicatorTooltipFeatureClick', onFeatureClick)
+    chart.subscribeAction('onCrosshairChange', (data: unknown) => {
+      const d = data as { kLineData?: { timestamp?: number }; paneId?: string; x?: number; y?: number } | undefined
+      onHoverRef.current?.(d?.kLineData?.timestamp ?? null)
+      // 大额成交 tooltip: hit-test the drawn dots in pane pixels.
+      const dots = tradeDotsRef.current
+      if (dots.length === 0 || d?.paneId !== 'candle_pane' || typeof d.x !== 'number' || typeof d.y !== 'number') {
+        setTradeTip(cur => (cur === null ? cur : null))
+        return
+      }
+      const px = chart.convertToPixel(dots.map(o => ({ timestamp: o.t.time, value: o.t.price })), { paneId: 'candle_pane' }) as { x?: number; y?: number }[]
+      const hits = hitDots(px.map((p, i) => ({ x: p.x ?? NaN, y: p.y ?? NaN, r: dots[i]!.r })), d.x, d.y)
+      if (hits.length === 0) {
+        setTradeTip(cur => (cur === null ? cur : null))
+        return
+      }
+      const rows = hits.slice(0, 4).map(i => dots[i]!.t)
+      const key = rows.map(t => String(t.id)).join('|')
+      const at = px[hits[0]!]!
+      const b = chart.getSize('candle_pane', 'main' as never)
+      const x = at.x ?? d.x
+      const y = at.y ?? d.y
+      let tz: string | undefined
+      try { tz = chart.getTimezone() } catch { tz = undefined }
+      setTradeTip(cur => (cur?.key === key ? cur : {
+        key, rows, ...(tz !== undefined ? { tz } : {}),
+        left: (b?.left ?? 0) + x, top: (b?.top ?? 0) + y,
+        flipX: b ? x > b.width - 210 : false, flipY: b ? y > b.height - 90 : false,
+      }))
+    })
+    chart.subscribeAction('onCandleBarClick', (data: unknown) => {
+      const d = data as { data?: { timestamp?: number } } | undefined
+      if (d?.data?.timestamp) onHoverRef.current?.(d.data.timestamp)
+    })
+    applyFold(foldRef.current)
+    // drawBarW flips 0→52 on the next paint; heal after layout so Y-axis height
+    // is not left at 0 (klinecharts: squashed bars, no ticks, last price glued to top).
+    let healCancelled = false
+    const heal = () => {
+      if (healCancelled || chartRef.current !== chart) return
+      // Always restore like 「自动」 — persisted autoScale=false must not leave Y frozen empty.
+      restoreCandleViewportLikeAutoButton(chart)
+    }
+    const observer = new ResizeObserver(() => { chart.resize() })
+    observer.observe(container)
+    const healRaf = requestAnimationFrame(() => {
+      requestAnimationFrame(heal)
+    })
+    // Data/size often settle after the first paint; retry so Y rebuilds with real candles.
+    const healLate = window.setTimeout(heal, 120)
+    const healLater = window.setTimeout(heal, 400)
+    return () => {
+      healCancelled = true
+      cancelAnimationFrame(healRaf)
+      window.clearTimeout(healLate)
+      window.clearTimeout(healLater)
+      observer.disconnect()
+      chartRef.current = null
+      onChartReadyRef.current?.(null)
+      setChartReady(0)
+      barSubscribeRef.current = null
+      mountedChips.current = new Map()
+      annotationOverlayIds.current = []
+      ohlcParkCleanup.current?.()
+      dispose(container)
+    }
+    // Deliberately NOT keyed on `data`: see `seriesKey`. Annotation and
+    // scenario identity are folded into the key by the caller, so a redraw
+    // still happens when the model marks the chart up.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seriesKey, dark])
+
+  // Agent marks + scenario lines. Own effect so a coordType change can re-run
+  // label placement without tearing the canvas (and the viewport) down.
+  useEffect(() => {
+    const chart = chartRef.current
+    if (chart === null) return
+    for (const id of annotationOverlayIds.current) {
+      try { chart.removeOverlay({ id }) } catch { /* gone */ }
+    }
+    annotationOverlayIds.current = []
+    const data = latest.current
+    if (data.candles.length === 0) return
+    const palette = dark ? DARK : LIGHT
+    const created: string[] = []
+    const sink = { createOverlay: (o: Parameters<Chart['createOverlay']>[0]) => {
+      const id = chart.createOverlay(o)
+      if (typeof id === 'string' && id) created.push(id)
+      return id
+    } } as Pick<Chart, 'createOverlay'>
+    const close = data.candles[data.candles.length - 1]!.close
+    const ctx: AnnotationRendererContext = { contractVersion: 1, timeframe: data.timeframe, close, palette }
+    // Collect every primitive before drawing any: label placement is the one
+    // decision that cannot be made one line at a time.
+    const annotations = data.annotations ?? []
+    const annotationColors = assignAnnotationColors(annotations, palette)
+    const primitives: DrawPrimitive[] = []
+    for (let idx = 0; idx < annotations.length; idx++) {
+      const annotation = annotations[idx]!
+      const renderer = annotationRenderers.get(annotation.type)
+      if (renderer === undefined) continue
+      try {
+        primitives.push(...renderer(annotation, { ...ctx, color: annotationColors[idx]! }))
+      } catch (error) {
+        console.warn(`[client-chart] renderer for '${annotation.type}' failed`, error)
+      }
+    }
+    for (const s of scenarios) {
+      if (s.triggerPrice !== undefined) {
+        const dup = primitives.some(p => p.kind === 'hline' && Math.abs(p.price - s.triggerPrice!) / s.triggerPrice! < 0.005)
+        if (!dup) primitives.push({ kind: 'hline', price: s.triggerPrice, dashed: true, color: palette.target, label: `${s.direction === 'bull' ? '多' : '空'}·触发` })
+      }
+      if (s.invalidationPrice !== undefined) {
+        const dup = primitives.some(p => p.kind === 'hline' && Math.abs(p.price - s.invalidationPrice!) / s.invalidationPrice! < 0.005)
+        if (!dup) primitives.push({ kind: 'hline', price: s.invalidationPrice, dashed: true, color: palette.invalidation, label: `${s.direction === 'bull' ? '多' : '空'}·失效` })
+      }
+    }
+    let lowest = Infinity
+    let highest = -Infinity
+    for (const c of data.candles) {
+      if (c.low < lowest) lowest = c.low
+      if (c.high > highest) highest = c.high
+    }
+    // Every caption pinned to a price — hline labels and zone labels (drawn at
+    // the zone's top edge) — goes through one lane pass, so they dodge each other.
+    const anchorOf = (prim: DrawPrimitive): number | undefined =>
+      prim.kind === 'hline' ? prim.price : prim.kind === 'region' ? Math.max(prim.low, prim.high) : undefined
+    const anchors = primitives.map(anchorOf)
+    // Fold the captions' own prices into the range. A target above every candle
+    // sits outside the candle range, and measuring collisions against a range
+    // that excludes it puts it at a fraction beyond 0..1 — comparable, but not
+    // to the same scale the chart will use once it makes room for the line.
+    for (const a of anchors) {
+      if (a === undefined) continue
+      if (a < lowest) lowest = a
+      if (a > highest) highest = a
+    }
+    const anchored = anchors.flatMap((a, i) => (a === undefined ? [] : [{ a, i }]))
+    const lanes = assignLabelLanes(anchored.map(x => x.a), lowest, highest, axisSettings.coordType)
+    const laneByIndex = new Map(anchored.map((x, k) => [x.i, lanes[k]!]))
+    primitives.forEach((prim, i) => drawPrimitive(sink, prim, laneByIndex.get(i) ?? 0))
+    annotationOverlayIds.current = created
+    // A projected script runs past the last candle: open enough right gutter to
+    // show it, and give the default back once no path needs it.
+    try {
+      const n = data.candles.length
+      const lastMs = Date.parse(data.candles[n - 1]!.time)
+      const barMs = n >= 2 ? lastMs - Date.parse(data.candles[n - 2]!.time) : 0
+      const width = chart.getSize('candle_pane', 'main' as never)?.width ?? 0
+      const gutter = futureGutterPx(primitives, lastMs, barMs, chart.getBarSpace().bar, width)
+      if (gutter !== undefined) {
+        if (!futureGutterSet.current) {
+          chart.setOffsetRightDistance(gutter)
+          futureGutterSet.current = true
+        }
+      } else if (futureGutterSet.current) {
+        chart.setOffsetRightDistance(DEFAULT_RIGHT_GUTTER_PX)
+        futureGutterSet.current = false
+      }
+    } catch (error) {
+      console.warn('[client-chart] future gutter failed', error)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marksKey, dark, axisSettings.coordType])
+
+  // Param edits or derivatives update: re-run calc in place; no canvas rebuild.
+  useEffect(() => {
+    const chart = chartRef.current
+    if (chart === null) return
+    chart.setStyles(ohlcTooltipAvoidTable(settings['REVPOINT']?.visible ?? false, chart.getSize('candle_pane', 'main' as never)?.width ?? 0))
+    for (const def of EDITABLE) {
+      if (def.name === 'LARGE_WALLS') continue
+      const s = settings[def.name]!
+      const ext = DERIV_HISTORY_INDICATORS.has(def.name) ? derivatives?.history
+        : def.name === 'MTF_SR' || def.name === 'DUAL_VIEW_HTF' ? { sourceTimeframe: data.timeframe, sourceTimeframeSeconds: mtfSourceTimeframeSeconds(data.timeframe) }
+        : def.name === 'AICOIN_KPATTERN' ? kpThemeExt(dark, settings)
+        : def.name === 'VOL_TIER' ? { dark }
+        : def.name === 'CVD_FLOW' ? (cvdRef.current ?? undefined) : undefined
+      if (def.name === 'AICOIN_TD') { syncAicoinTd(chart, s, dark); continue }
+      if (def.pane !== undefined) {
+        const exists = hasIndicator(chart, def.pane, def.name)
+        if (!s.visible) {
+          if (exists) removeInd(chart, def.pane, def.name)
+          if (def.name === 'RSI_GRID') {
+            removeInd(chart, 'pane_rsi_cum', 'RSI_GRID_CUM')
+            removeInd(chart, 'candle_pane', 'RSI_GRID_MARKS')
+          }
+        } else if (!exists) {
+          createIndicatorInPane(chart, { name: def.name, calcParams: s.params, extendData: ext }, { paneId: def.pane, height: PANE_HEIGHT })
+          chart.overrideYAxis({ paneId: def.pane, gap: { top: 0.24, bottom: 0.10 } })
+          if (def.name === 'RSI_GRID') {
+            createIndicatorInPane(chart, { name: 'RSI_GRID_CUM', calcParams: s.params }, { paneId: 'pane_rsi_cum', height: PANE_HEIGHT })
+            chart.overrideYAxis({ paneId: 'pane_rsi_cum', gap: { top: 0.24, bottom: 0.10 } })
+            createIndicatorInPane(chart, { name: 'RSI_GRID_MARKS', calcParams: s.params }, { paneId: 'candle_pane', isStack: true })
+          }
+        } else {
+          overrideInd(chart, { name: def.name, calcParams: s.params, extendData: ext }, def.pane)
+          if (def.name === 'RSI_GRID') {
+            overrideInd(chart, { name: 'RSI_GRID_CUM', calcParams: s.params }, 'pane_rsi_cum')
+            overrideInd(chart, { name: 'RSI_GRID_MARKS', calcParams: s.params }, 'candle_pane')
+          }
+        }
+        continue
+      }
+      syncIndicatorInPane(chart, { name: def.name, calcParams: s.params, extendData: ext }, s.visible, { paneId: 'candle_pane', isStack: true })
+    }
+  }, [settings, derivatives, cvd, data.timeframe, dark])
+
+  // Re-filter crossed/swept walls and refresh the ±% captions as price moves
+  // intra-bar, not only when a new bar opens: one bucket ≈ 0.02% (~$0.45 on ETH),
+  // tight enough to clear crossed 1m walls immediately without rebuilding on 1-tick noise.
+  const wallLastBar = data.candles[data.candles.length - 1]
+  const bucket2bp = (v: number | undefined): number =>
+    typeof v === 'number' && v > 0 ? Math.round(Math.log(v) / 0.0002) : 0
+  const wallPriceKey = `${bucket2bp(wallLastBar?.close)}|${bucket2bp(wallLastBar?.high)}|${bucket2bp(wallLastBar?.low)}`
+
+  // CoinGlass 大单墙: horizontal lines, toggled via 指标参数 → 大单墙.
+  useEffect(() => {
+    const chart = chartRef.current
+    if (chart === null) return
+    try { chart.removeOverlay({ groupId: 'tm_large_walls' }) } catch { /* already gone */ }
+    for (const id of wallOverlayIds.current) {
+      try { chart.removeOverlay({ id }) } catch { /* already gone */ }
+    }
+    wallOverlayIds.current = []
+    if (!(settings['LARGE_WALLS']?.visible) || !largeWalls?.walls?.length) return
+    const disp = wallDisplay(settings['LARGE_WALLS']?.params)
+    const maxDistPct = (settings['LARGE_WALLS']?.params?.[1] ?? 20) / 100
+    const sideLimit = settings['LARGE_WALLS']?.params?.[2] ?? 8
+
+    const last = data.candles[data.candles.length - 1]
+    const curP = last?.close
+
+    let walls = displayedRows(filterWallsByMarket(largeWalls.walls, wallMarket), w => w.currentUsd, disp.showWalls, disp.wallMin)
+    if (typeof curP === 'number' && curP > 0) {
+      walls = walls.filter(w => Math.abs(w.price - curP) / curP <= maxDistPct)
+    }
+    // Hide walls already crossed by curP or swept by a candle opened after the snapshot.
+    walls = dropCrossedWalls(walls, curP, { candles: data.candles, ...(largeWalls.updatedAt !== undefined ? { snapshotAt: largeWalls.updatedAt } : {}) })
+
+    const buys = walls
+      .filter(w => w.side === 'buy')
+      .sort((a, b) => b.price - a.price || b.currentUsd - a.currentUsd)
+      .slice(0, sideLimit)
+    const sells = walls
+      .filter(w => w.side === 'sell')
+      .sort((a, b) => a.price - b.price || b.currentUsd - a.currentUsd)
+      .slice(0, sideLimit)
+    const finalWalls = [...sells, ...buys]
+    if (finalWalls.length === 0) return
+
+    const fmt = (n: number): string => {
+      const abs = Math.abs(n)
+      if (abs >= 1e8) return `${(abs / 1e8).toFixed(2)}亿`
+      if (abs >= 1e4) return `${(abs / 1e4).toFixed(1)}万`
+      return `${abs.toFixed(0)}`
+    }
+
+    const lowest = Math.min(...data.candles.map(c => c.low))
+    const highest = Math.max(...data.candles.map(c => c.high))
+    const lanes = assignLabelLanes(finalWalls.map(w => w.price), lowest, highest, axisSettings.coordType)
+    const nowMs = Date.now()
+    const overlays = finalWalls.map((w, i) => {
+      const color = w.side === 'buy' ? '#3ddc97' : '#f47067'
+      const distStr = typeof curP === 'number' && curP > 0
+        ? ` (${w.price >= curP ? '+' : ''}${(((w.price - curP) / curP) * 100).toFixed(1)}%)`
+        : ''
+      const mTag = isSpotWallMarket(w.market) ? '现货' : '合约'
+      const age = formatWallAge(w, nowMs, true)
+      const ageStr = age ? ` · 挂${age}` : ''
+      const label = `${w.exchange}${mTag} ${w.side === 'buy' ? '买' : '卖'} $${fmt(w.currentUsd)}${distStr}${ageStr}`
+      return {
+        name: 'tm_hline',
+        groupId: 'tm_large_walls',
+        lock: true,
+        points: [{ value: w.price }],
+        extendData: { color, dashed: true, label, lane: lanes[i] ?? 0, laneWidth: 255 },
+      }
+    })
+    const ids = chart.createOverlay(overlays)
+    if (Array.isArray(ids)) {
+      for (const id of ids) {
+        if (typeof id === 'string' && id) wallOverlayIds.current.push(id)
+      }
+    } else if (typeof ids === 'string' && ids) {
+      wallOverlayIds.current.push(ids)
+    }
+  }, [settings, largeWalls, wallMarket, seriesKey, wallPriceKey, axisSettings.coordType])
+
+  // CoinGlass 大额成交: executed large trades as dots on their fill bar/price
+  // (buy green, sell red, radius by size). One overlay, rebuilt per poll only.
+  useEffect(() => {
+    const chart = chartRef.current
+    if (chart === null) return
+    try { chart.removeOverlay({ groupId: 'tm_large_trades' }) } catch { /* already gone */ }
+    tradeDotsRef.current = []
+    setTradeTip(null)
+    const p = settings['LARGE_WALLS']
+    const disp = wallDisplay(p?.params)
+    if (!p?.visible || !largeWalls?.trades?.length || data.candles.length === 0) return
+    const firstMs = Date.parse(data.candles[0]!.time)
+    const trades = displayedRows(filterWallsByMarket(largeWalls.trades, wallMarket), t => t.usd, disp.showTrades, disp.tradeMin)
+      .filter(t => t.time >= firstMs)
+    if (trades.length === 0) return
+    // Same scale for both books so spot and perp dots compare by size.
+    const radius = (usd: number): number => Math.min(9, 2.5 + 1.5 * Math.sqrt(usd / 500_000))
+    tradeDotsRef.current = trades.map(t => ({ t, r: radius(t.usd) }))
+    const wan = (usd: number): string => usd >= 1e8 ? `${(usd / 1e8).toFixed(2)}亿` : `${(usd / 1e4).toFixed(usd >= 1e7 ? 0 : 1)}万`
+    chart.createOverlay({
+      name: 'tm_dots',
+      groupId: 'tm_large_trades',
+      lock: true,
+      points: trades.map(t => ({ timestamp: t.time, value: t.price })),
+      extendData: {
+        dots: trades.map(t => ({
+          color: t.side === 'buy' ? '#3ddc97' : '#f47067',
+          r: radius(t.usd),
+          label: wan(t.usd),
+        })),
+      },
+    })
+  }, [settings, largeWalls, wallMarket, seriesKey])
+
+  // Live tail: push the newest bar into the existing plot. klinecharts updates
+  // the last bar in place, or appends when the timestamp has moved on, so the
+  // same call covers "the current candle ticked" and "a new candle opened".
+  // Chip panes are mounted/unmounted incrementally on the live canvas, so a
+  // toggle keeps zoom and scroll (no dispose/init).
+  useEffect(() => {
+    const chart = chartRef.current
+    const last = data.candles[data.candles.length - 1]
+    if (chart === null || last === undefined) return
+    barSubscribeRef.current?.(toKLine(last))
+    const plan = planChipSync(active, mountedChips.current, id => {
+      const ind = chipIndicator(id, forced)
+      if (!ind) return false
+      if (ind.builtIn === true) return ind.name !== 'RSI_GRID' && ind.name !== 'VOL_TIER'
+      return hasSeries(data, ind.figures)
+    })
+    for (const id of plan.remove) {
+      const paneId = mountedChips.current.get(id)
+      mountedChips.current.delete(id)
+      if (paneId === undefined) continue
+      // The pane may have been mounted under the other meaning of the chip (reader vs walkthrough).
+      const names = new Set([chipIndicator(id, false)?.name, chipIndicator(id, true)?.name])
+      for (const name of names) {
+        if (name === undefined) continue
+        try { removeInd(chart, paneId, name) } catch { /* already gone */ }
+      }
+    }
+    for (const id of plan.add) {
+      const ind = chipIndicator(id, forced)!
+      if (ind.builtIn === true) {
+        const paneId = `pane_${id}`
+        createIndicatorInPane(chart, ind.name, { paneId, height: PANE_HEIGHT })
+        mountedChips.current.set(id, paneId)
+        continue
+      }
+      const create = { name: ind.name, extendData: seriesRows(data, ind.figures) }
+      const paneId = ind.overlay === true ? 'candle_pane' : `pane_${id}`
+      createIndicatorInPane(chart, create, { paneId, isStack: ind.overlay === true, height: PANE_HEIGHT })
+      mountedChips.current.set(id, paneId)
+    }
+    for (const [id, paneId] of mountedChips.current) {
+      if (plan.add.includes(id)) continue
+      const ind = chipIndicator(id, forced)
+      if (!ind || ind.builtIn === true || !hasSeries(data, ind.figures)) continue
+      overrideInd(chart, { name: ind.name, extendData: seriesRows(data, ind.figures) }, paneId)
+    }
+  }, [data, active, seriesKey, dark, forced])
+
+  // Tell the ink layer which pane ids exist. Runs after the chip sync above, so the map is current.
+  const volumeVisible = settings['VOL_TIER']?.visible === true
+  useEffect(() => {
+    if (chartRef.current === null) return
+    const next = lessonPaneIds(mountedChips.current, volumeVisible ? 'pane_vol' : undefined)
+    setLessonPanes(cur => (samePaneIds(cur, next) ? cur : next))
+  }, [data, active, seriesKey, dark, forced, volumeVisible, chartReady])
+
+  // Indicator alertconditions (VB + NW + Dual View HTF + AiCoin K线形态): fire once per id; first eval seeds.
+  const vbSeen = useRef<Set<string> | null>(null)
+  const [vbToasts, setVbToasts] = useState<{ id: string; text: string }[]>([])
+  useEffect(() => {
+    const fired: { id: string; text: string }[] = []
+    const vb = settings['VB_PRO_READ']
+    if (vb?.visible) fired.push(...vbAlertEvents(data.candles, vb.params))
+    const nw = settings['NW_TREND']
+    if (nw?.visible) fired.push(...nwAlertEvents(data.candles, nw.params))
+    const dv = settings['DUAL_VIEW_HTF']
+    if (dv?.visible) {
+      const rows = data.candles.map(c => ({ ...c, timestamp: Date.parse(c.time) }))
+      fired.push(...dvAlertEvents(rows, dv.params, data.timeframe))
+    }
+    const kp = settings['AICOIN_KPATTERN']
+    if (kp?.visible) fired.push(...kpAlertEvents(data.candles, kp.params))
+    const td = settings['AICOIN_TD']
+    if (td?.visible) fired.push(...tdAlertEvents(data.candles, td.params))
+    const rp = settings['REVPOINT']
+    if (rp?.visible) fired.push(...revPointAlertEvents(data.candles, rp.params))
+    if (fired.length === 0 && !(vb?.visible || dv?.visible || nw?.visible || kp?.visible || td?.visible || rp?.visible)) { vbSeen.current = null; return }
+    if (vbSeen.current === null) { vbSeen.current = new Set(fired.map(f => f.id)); return }
+    const fresh = fired.filter(f => !vbSeen.current!.has(f.id))
+    if (fresh.length === 0) return
+    for (const f of fresh) vbSeen.current.add(f.id)
+    setVbToasts(t => [...t, ...fresh].slice(-4))
+    for (const f of fresh) setTimeout(() => setVbToasts(t => t.filter(x => x.id !== f.id)), 15000)
+  }, [data, settings])
+
+  useEffect(() => {
+    const chart = chartRef.current
+    if (chart === null) return
+    chart.overrideYAxis({
+      paneId: 'candle_pane',
+      name: yAxisNameForCoord(axisSettings.coordType),
+      gap: axisSettings.autoScale.candle ? { top: 0.08, bottom: 0.05 } : { top: 0.2, bottom: 0.1 },
+    })
+    if (axisSettings.autoScale.candle) {
+      healCandleViewport(chart, true)
+    } else {
+      setCandleYAxisAutoCalc(chart, false)
+    }
+  }, [axisSettings])
+
+  useEffect(() => {
+    const container = el.current
+    if (!container) return
+
+    let isPointerDown = false
+    let startX = 0
+    let startY = 0
+    let isVerticalUnlocked = false
+
+    const onPointerDown = (e: MouseEvent) => {
+      if (e.button !== 0) return
+      isPointerDown = true
+      startX = e.clientX
+      startY = e.clientY
+      isVerticalUnlocked = false
+    }
+
+    const onPointerMove = (e: MouseEvent) => {
+      if (!isPointerDown) return
+      const dy = e.clientY - startY
+      if (!isVerticalUnlocked && Math.abs(dy) >= 3) {
+        const chart = chartRef.current
+        if (getCandleYAxisAutoCalc(chart) === true) {
+          isVerticalUnlocked = true
+          setCandleYAxisAutoCalc(chart, false)
+          const current = getAxisSettings()
+          if (current.autoScale.candle) {
+            setAxisSettings({
+              ...current,
+              autoScale: { ...current.autoScale, candle: false },
+            })
+          }
+        }
+      }
+    }
+
+    const onPointerUp = () => {
+      if (isPointerDown) {
+        isPointerDown = false
+        const chart = chartRef.current
+        if (getCandleYAxisAutoCalc(chart) === false) {
+          const current = getAxisSettings()
+          if (current.autoScale.candle) {
+            setAxisSettings({
+              ...current,
+              autoScale: { ...current.autoScale, candle: false },
+            })
+          }
+        }
+      }
+    }
+
+    const onDoubleClick = () => {
+      const chart = chartRef.current
+      if (!chart) return
+      resetCandleYAxisAuto(chart)
+      const current = getAxisSettings()
+      if (!current.autoScale.candle) {
+        setAxisSettings({
+          ...current,
+          autoScale: { ...current.autoScale, candle: true },
+        })
+      }
+    }
+
+    const onWheel = (e: WheelEvent) => {
+      const chart = chartRef.current
+      if (!chart) return
+      const rect = container.getBoundingClientRect()
+      const isOverYAxis = e.clientX >= rect.right - 80 && e.clientY <= rect.bottom - 20
+      if (isOverYAxis) {
+        e.preventDefault()
+        e.stopPropagation()
+        const yAxis = getCandleYAxis(chart)
+        if (!yAxis || typeof yAxis.getRange !== 'function' || typeof yAxis.setRange !== 'function') return
+        try {
+        const range = yAxis.getRange()
+        if (!range || range.range <= 0) return
+        const zoomFactor = e.deltaY > 0 ? 1.15 : 0.85
+        const newRange = range.range * zoomFactor
+        const relY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+        const currentPriceAtCursor = typeof yAxis.convertFromPixel === 'function'
+          ? yAxis.convertFromPixel(e.clientY - rect.top)
+          : range.from + (1 - relY) * range.range
+        const centerRatio = Number.isFinite(currentPriceAtCursor)
+          ? (currentPriceAtCursor - range.from) / range.range
+          : 0.5
+        const newFrom = currentPriceAtCursor - centerRatio * newRange
+        const newTo = newFrom + newRange
+        const realFrom = typeof yAxis.convertToRealValue === 'function' ? yAxis.convertToRealValue(newFrom) : newFrom
+        const realTo = typeof yAxis.convertToRealValue === 'function' ? yAxis.convertToRealValue(newTo) : newTo
+        yAxis.setRange({
+          from: newFrom,
+          to: newTo,
+          range: newRange,
+          realFrom,
+          realTo,
+          realRange: realTo - realFrom,
+        })
+        adjustChartViewport(chart)
+        } catch { return /* internal axis API changed: Y-wheel zoom degrades to a no-op */ }
+        const current = getAxisSettings()
+        if (current.autoScale.candle) {
+          setAxisSettings({
+            ...current,
+            autoScale: { ...current.autoScale, candle: false },
+          })
+        }
+      }
+    }
+
+    container.addEventListener('mousedown', onPointerDown)
+    window.addEventListener('mousemove', onPointerMove)
+    window.addEventListener('mouseup', onPointerUp)
+    container.addEventListener('dblclick', onDoubleClick)
+    container.addEventListener('wheel', onWheel, { passive: false })
+
+    return () => {
+      container.removeEventListener('mousedown', onPointerDown)
+      window.removeEventListener('mousemove', onPointerMove)
+      window.removeEventListener('mouseup', onPointerUp)
+      container.removeEventListener('dblclick', onDoubleClick)
+      container.removeEventListener('wheel', onWheel)
+    }
+  }, [])
+
+  // After DrawingBar mounts/toggles, canvas `left` changes — same restore as 「自动」.
+  useEffect(() => {
+    if (chartReady === 0) return
+    const chart = chartRef.current
+    if (!chart) return
+    let cancelled = false
+    const run = () => { if (!cancelled && chartRef.current === chart) restoreCandleViewportLikeAutoButton(chart) }
+    const id = requestAnimationFrame(() => { requestAnimationFrame(run) })
+    const late = window.setTimeout(run, 120)
+    return () => { cancelled = true; cancelAnimationFrame(id); window.clearTimeout(late) }
+  }, [chartReady, drawBarOpen])
+
+  // In fill mode the plot is sized by the flex parent and the ResizeObserver
+  // above keeps klinecharts in step; `minHeight` is the floor below which a
+  // candlestick chart stops being a chart. Indicator panes then divide the
+  // available height rather than extending the card downward.
+  // Drawing bar is 52px (Pro DrawingBar width); keep chart canvas to its right.
+  const drawBarW = chartReady > 0 && drawBarOpen ? 52 : 0
+  return (
+    <div style={{ position: 'relative', width: '100%', overflow: 'visible', ...(fill ? { flex: '1 1 auto', minHeight: FILL_MIN_HEIGHT } : { height: baseHeight + paneCount * PANE_HEIGHT }) }}>
+      <div ref={el} onMouseLeave={() => setTradeTip(null)} style={{ position: 'absolute', left: drawBarW, right: 0, top: 0, bottom: 0, width: 'auto', height: 'auto' }} />
+      {tradeTip !== null && (
+        <div role="tooltip" aria-label="大额成交" style={{
+          position: 'absolute', zIndex: 6, pointerEvents: 'none', whiteSpace: 'nowrap',
+          left: drawBarW + tradeTip.left + (tradeTip.flipX ? -12 : 12), top: tradeTip.top + (tradeTip.flipY ? -12 : 12),
+          transform: `translate(${tradeTip.flipX ? '-100%' : '0'}, ${tradeTip.flipY ? '-100%' : '0'})`,
+          background: dark ? 'rgba(22,24,28,0.95)' : 'rgba(255,255,255,0.97)', color: dark ? '#e6edf3' : '#1f2328',
+          border: `1px solid ${dark ? '#30363d' : '#d0d7de'}`, borderRadius: 4, padding: '4px 8px', fontSize: 11, lineHeight: 1.6,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+        }}>
+          {tradeTip.rows.map(t => {
+            const color = t.side === 'buy' ? '#3ddc97' : '#f47067'
+            const usd = t.usd >= 1e8 ? `${(t.usd / 1e8).toFixed(2)}亿` : `${(t.usd / 1e4).toFixed(1)}万`
+            return (
+              <div key={String(t.id)}>
+                <span style={{ color, fontWeight: 600 }}>{t.exchange}{isSpotWallMarket(t.market) ? '现货' : '合约'} 大额{t.side === 'buy' ? '买入' : '卖出'}</span>
+                {' '}{t.price} · ${usd} · {t.amount > 0 ? `${Number(t.amount.toFixed(2))} 枚` : '币数未知'} · {tradeTimeText(t.time, tradeTip.tz)}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {overlay !== undefined && chartReady > 0 && chartRef.current !== null
+        ? (
+          <div data-lesson-box style={{ position: 'absolute', left: drawBarW, right: 0, top: 0, bottom: 0, pointerEvents: 'none', zIndex: 2 }}>
+            {overlay({ chart: chartRef.current, panes: lessonPanes })}
+          </div>
+        )
+        : null}
+      {chartReady > 0 && drawBarOpen ? <ChartTools chart={chartRef.current} dark={dark} /> : null}
+      {vbToasts.length > 0 && (
+        <div role="status" aria-label="指标提醒" style={{ position: 'absolute', right: 70, top: 8, zIndex: 5, display: 'flex', flexDirection: 'column', gap: 4, pointerEvents: 'auto' }}>
+          {vbToasts.map(t => (
+            <div key={t.id} onClick={() => setVbToasts(x => x.filter(y => y.id !== t.id))} title="点击关闭"
+              style={{ background: 'rgba(255,167,38,0.92)', color: '#111', fontSize: 12, padding: '4px 8px', borderRadius: 4, cursor: 'pointer', boxShadow: '0 1px 4px rgba(0,0,0,0.3)' }}>
+              🔔 {t.text}
+            </div>
+          ))}
+        </div>
+      )}
+      {!axisSettings.autoScale.candle && (
+        <button
+          type="button"
+          onClick={() => {
+            restoreCandleViewportLikeAutoButton(chartRef.current)
+          }}
+          title="双击画布或点击此处恢复K线自动坐标"
+          style={{
+            position: 'absolute',
+            right: 68,
+            bottom: 8,
+            zIndex: 10,
+            padding: '2px 8px',
+            fontSize: 11,
+            fontWeight: 600,
+            color: '#38bdf8',
+            background: 'rgba(18, 18, 20, 0.85)',
+            border: '1px solid rgba(56, 189, 248, 0.5)',
+            borderRadius: 4,
+            cursor: 'pointer',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
+          }}
+        >
+          <span>↺ 自动</span>
+        </button>
+      )}
+    </div>
+  )
+}
+
+function fmt(x: unknown): string {
+  return typeof x === 'number' && Number.isFinite(x) ? String(x) : '—'
+}
+
+function get(x: unknown, key: string): unknown {
+  return typeof x === 'object' && x !== null && !Array.isArray(x) ? (x as Record<string, unknown>)[key] : undefined
+}
+
+const SHELL: CSSProperties = {
+  border: '1px solid var(--dsw-alias-border, rgba(128, 128, 128, 0.25))',
+  borderRadius: 8,
+  padding: 12,
+  margin: '4px 0',
+  fontSize: 12,
+  lineHeight: 1.5,
+}
+
+/**
+ * A render throw inside the chart used to blank the whole panel, because
+ * nothing above ChartBody catches. This keeps the toolbar and prints the
+ * error instead. ponytail: class component because React error boundaries
+ * still have no hook equivalent; upgrade when one ships.
+ */
+export class ChartErrorBoundary extends Component<{ children: ReactNode; onReset?: () => void }, { message: string | null }> {
+  state = { message: null as string | null }
+  static getDerivedStateFromError(error: unknown): { message: string } {
+    return { message: error instanceof Error ? error.message : String(error) }
+  }
+  override componentDidCatch(error: unknown, info: ErrorInfo): void {
+    console.error('[client-chart] chart render failed', error, info.componentStack)
+  }
+  override render(): ReactNode {
+    return this.state.message === null
+      ? this.props.children
+      : (
+        <Fallback
+          text={`图表渲染失败：${this.state.message}`}
+          error
+          onReset={() => {
+            this.setState({ message: null })
+            this.props.onReset?.()
+          }}
+        />
+      )
+  }
+}
+
+function Fallback({ text, error, onReset }: { text: string; error: boolean; onReset?: () => void }): JSX.Element {
+  return (
+    <div style={SHELL}>
+      {onReset !== undefined ? (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <strong style={{ color: 'var(--dsw-alias-state-error-primary, #e0563f)' }}>图表渲染异常</strong>
+          <button
+            type="button"
+            onClick={onReset}
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.3))',
+              borderRadius: 4,
+              padding: '2px 8px',
+              fontSize: 11,
+              cursor: 'pointer',
+              color: 'inherit',
+            }}
+          >
+            重试
+          </button>
+        </div>
+      ) : null}
+      <pre style={{
+        margin: 0, maxHeight: 260, overflow: 'auto', whiteSpace: 'pre-wrap', fontSize: 12,
+        color: error ? 'var(--dsw-alias-state-error-primary, #e0563f)' : 'inherit',
+      }}>{text}</pre>
+    </div>
+  )
+}
+
+function annotationRow(a: ChartAnnotation, close: number, p: Palette, resolvedColor?: string): { key: string; color: string; label: string; where: string; distance: string; sources: string } | null {
+  const sources = Array.isArray(a['sources']) ? a['sources'].filter((s): s is string => typeof s === 'string').join(' + ') : ''
+  const label = str(a['label']) ?? a.type
+  const color = resolvedColor ?? resolveAnnotationColor(a, p)
+  const pct = (x: number): string => close === 0 ? '' : `${x >= close ? '+' : ''}${(((x - close) / close) * 100).toFixed(2)}%`
+  if (a.type === 'level') {
+    const price = num(a['price'])
+    if (price === undefined) return null
+    return { key: `level:${label}:${price}`, color, label, where: String(price), distance: pct(price), sources }
+  }
+  if (a.type === 'zone') {
+    const low = num(a['low'])
+    const high = num(a['high'])
+    if (low === undefined || high === undefined) return null
+    return { key: `zone:${label}:${low}`, color, label, where: `${low} – ${high}`, distance: pct((low + high) / 2), sources }
+  }
+  if (a.type === 'path') {
+    const n = Array.isArray(a['points']) ? a['points'].length : 0
+    return { key: `path:${label}`, color, label, where: `${n} 点路径`, distance: '', sources }
+  }
+  const known = annotationRenderers.has(a.type)
+  return { key: `x:${a.type}:${label}`, color: p.faint, label, where: known ? a.type : `${a.type}（无渲染器）`, distance: '', sources }
+}
+
+/**
+ * The chart itself, driven by a payload and nothing else. Split out of
+ * ChartCard so the same body serves two very different seats: the tool-call
+ * card inside a chat bubble, and the persistent column of the trading frame.
+ * It knows nothing about tool calls, blocks, or slots.
+ *
+ * @param payload - the durable chart payload to render.
+ * @param chartHeight - base plot height in px; the panel gives it more room
+ *   than a chat bubble can afford.
+ * @param shell - container style, so the panel can drop the card's border and
+ *   margins and sit flush in its column.
+ */
+function Switch({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={(e) => { e.stopPropagation(); onChange(!checked) }}
+      style={{
+        width: 36,
+        height: 20,
+        borderRadius: 10,
+        background: checked ? '#ffffff' : '#27272a',
+        border: '1px solid #3f3f46',
+        position: 'relative',
+        cursor: 'pointer',
+        padding: 0,
+        transition: 'background 0.15s ease',
+        outline: 'none',
+      }}
+    >
+      <span
+        style={{
+          display: 'block',
+          width: 14,
+          height: 14,
+          borderRadius: 7,
+          background: checked ? '#09090b' : '#71717a',
+          position: 'absolute',
+          top: 2,
+          left: checked ? 18 : 2,
+          transition: 'left 0.15s ease',
+        }}
+      />
+    </button>
+  )
+}
+
+function AxisMenu({
+  settings,
+  palette,
+  onChange,
+  onClose,
+}: {
+  settings: AxisSettings
+  palette: Palette
+  onChange: (next: AxisSettings) => void
+  onClose: () => void
+}): JSX.Element {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        onClose()
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [onClose])
+
+  const itemStyle: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '7px 14px',
+    cursor: 'pointer',
+    fontSize: 13,
+    color: '#e4e4e7',
+    userSelect: 'none',
+  }
+
+  const headerStyle: CSSProperties = {
+    fontSize: 12,
+    color: '#a1a1aa',
+    padding: '6px 14px 4px',
+    userSelect: 'none',
+  }
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        position: 'absolute',
+        top: 28,
+        right: 0,
+        zIndex: 100,
+        width: 160,
+        background: '#121214',
+        border: `1px solid ${palette.line}`,
+        borderRadius: 8,
+        boxShadow: '0 10px 30px rgba(0,0,0,0.7)',
+        padding: '6px 0',
+        fontFamily: FONT_FAMILY,
+      }}
+    >
+      <div style={headerStyle}>坐标类型</div>
+      <div
+        style={itemStyle}
+        onClick={() => onChange({ ...settings, coordType: 'normal' })}
+      >
+        <span>常规</span>
+        {settings.coordType === 'normal' ? <span style={{ color: '#ffffff', fontWeight: 600 }}>✓</span> : null}
+      </div>
+      <div
+        style={itemStyle}
+        onClick={() => onChange({ ...settings, coordType: 'percentage' })}
+      >
+        <span>百分比</span>
+        {settings.coordType === 'percentage' ? <span style={{ color: '#ffffff', fontWeight: 600 }}>✓</span> : null}
+      </div>
+      <div
+        style={itemStyle}
+        onClick={() => onChange({ ...settings, coordType: 'log' })}
+      >
+        <span>对数</span>
+        {settings.coordType === 'log' ? <span style={{ color: '#ffffff', fontWeight: 600 }}>✓</span> : null}
+      </div>
+
+      <div style={{ height: 1, background: palette.line, margin: '6px 0' }} />
+
+      <div style={headerStyle}>自动坐标</div>
+      <div style={itemStyle}>
+        <span>K线图</span>
+        <Switch
+          checked={settings.autoScale.candle}
+          onChange={(v) => onChange({ ...settings, autoScale: { ...settings.autoScale, candle: v } })}
+        />
+      </div>
+      <div style={itemStyle}>
+        <span>RSI</span>
+        <Switch
+          checked={settings.autoScale.rsi}
+          onChange={(v) => onChange({ ...settings, autoScale: { ...settings.autoScale, rsi: v } })}
+        />
+      </div>
+      <div style={itemStyle}>
+        <span>Acc. L/S</span>
+        <Switch
+          checked={settings.autoScale.accLs}
+          onChange={(v) => onChange({ ...settings, autoScale: { ...settings.autoScale, accLs: v } })}
+        />
+      </div>
+      <div style={itemStyle}>
+        <span>MACD</span>
+        <Switch
+          checked={settings.autoScale.macd}
+          onChange={(v) => onChange({ ...settings, autoScale: { ...settings.autoScale, macd: v } })}
+        />
+      </div>
+    </div>
+  )
+}
+
+/**
+ * One row per editable indicator: show/hide + its params. Applies on blur or
+ * Enter (not per keystroke, so typing "100" never computes WMA(1) and WMA(10)
+ * on the way). Shared by every chart on the page and kept across restarts.
+ */
+const CATEGORIES: { id: string; label: string; names?: string[] }[] = [
+  { id: 'all', label: '全部' },
+  { id: 'trend', label: '趋势与通道', names: ['WMA', 'SUPERTREND', 'EVASIVE_ST', 'NW_TREND', 'VB_PRO_READ'] },
+  { id: 'pattern', label: '形态与结构', names: ['DUAL_VIEW_HTF', 'AICOIN_KPATTERN', 'OB_BB', 'MTF_SR'] },
+  { id: 'oscillator', label: '震荡与网格', names: ['RSI_GRID', 'AICOIN_TD', 'REVPOINT', 'ENTRY_SIGNAL'] },
+  { id: 'deriv', label: '主力与衍生品', names: ['VOL_TIER', 'OI_POSTURE', 'CVD_FLOW', 'LARGE_WALLS'] },
+]
+
+const HTF_BULLISH_INDICES = [21, 23, 24, 27, 29, 30, 32, 34, 35, 37]
+const HTF_BEARISH_INDICES = [20, 22, 25, 26, 28, 31, 33, 36, 38]
+
+/**
+ * Modern grouped, collapsible indicator param editor with dual-direction
+ * symmetry, quick pattern batch toggles, and compact card layout.
+ */
+function ParamEditor({ settings, palette, onClose }: {
+  settings: IndicatorSettings
+  palette: Palette
+  onClose: () => void
+}): JSX.Element {
+  const [activeCategory, setActiveCategory] = useState<string>('all')
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+
+  const input: CSSProperties = {
+    width: 56, background: 'transparent', color: 'inherit', fontSize: 11,
+    border: `1px solid ${palette.line}`, borderRadius: 3, padding: '1px 4px',
+  }
+
+  const commit = (name: string, i: number, raw: string, el: HTMLInputElement): void => {
+    const s = settings[name]!
+    const params = [...s.params]
+    params[i] = Number(raw)
+    const next = sanitizeSettings({ ...settings, [name]: { ...s, params } })
+    el.value = String(next[name]!.params[i])
+    if (next[name]!.params[i] !== s.params[i]) setSettings(next)
+  }
+
+  const toggleExpand = (name: string): void => {
+    setExpanded(prev => ({ ...prev, [name]: !(prev[name] ?? settings[name]?.visible ?? false) }))
+  }
+
+  const setAllExpanded = (val: boolean): void => {
+    const next: Record<string, boolean> = {}
+    for (const def of EDITABLE) next[def.name] = val
+    setExpanded(next)
+  }
+
+  const cat = CATEGORIES.find(c => c.id === activeCategory)
+  const visibleDefs = EDITABLE.filter(d => !cat?.names || cat.names.includes(d.name))
+
+  return (
+    <div
+      role="group"
+      aria-label="指标参数"
+      style={{
+        display: 'flex', flexDirection: 'column', gap: 8, padding: 10, marginBottom: 8, fontSize: 11,
+        border: `1px solid ${palette.line}`, borderRadius: 6, flex: '0 0 auto',
+        maxHeight: '420px', overflowY: 'auto', background: 'rgba(15, 20, 25, 0.4)',
+      }}
+    >
+      {/* Category Tabs */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, borderBottom: `1px solid ${palette.line}`, paddingBottom: 6 }}>
+        {CATEGORIES.map(c => {
+          const active = c.id === activeCategory
+          return (
+            <button
+              key={c.id}
+              onClick={() => setActiveCategory(c.id)}
+              style={{
+                background: active ? 'rgba(83, 155, 245, 0.15)' : 'transparent',
+                color: active ? '#539bf5' : palette.faint,
+                border: `1px solid ${active ? '#539bf5' : palette.line}`,
+                borderRadius: 4, padding: '2px 8px', fontSize: 11, cursor: 'pointer',
+                fontWeight: active ? 'bold' : 'normal',
+              }}
+            >
+              {c.label}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Indicator Cards */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {visibleDefs.map(def => {
+          const s = settings[def.name]!
+          const isExpanded = expanded[def.name] ?? s.visible
+          const hasParams = def.params.length > 0
+
+          return (
+            <div
+              key={def.name}
+              style={{
+                display: 'flex', flexDirection: 'column', gap: 6,
+                padding: '6px 8px', borderRadius: 4,
+                border: `1px solid ${s.visible ? 'rgba(83, 155, 245, 0.25)' : palette.line}`,
+                background: s.visible ? 'rgba(83, 155, 245, 0.03)' : 'transparent',
+              }}
+            >
+              {/* Header row */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontWeight: s.visible ? 'bold' : 'normal' }}>
+                  <input
+                    type="checkbox"
+                    checked={s.visible}
+                    onChange={e => {
+                      const willBeVisible = e.target.checked
+                      setSettings({ ...settings, [def.name]: { ...s, visible: willBeVisible } })
+                      if (willBeVisible && expanded[def.name] === undefined) {
+                        setExpanded(prev => ({ ...prev, [def.name]: true }))
+                      }
+                    }}
+                  />
+                  <span>{def.title}</span>
+                  <span style={{
+                    fontSize: 9, padding: '0 4px', borderRadius: 3,
+                    border: `1px solid ${s.visible ? 'rgba(61,220,151,0.4)' : palette.line}`,
+                    color: s.visible ? '#3ddc97' : palette.faint,
+                  }}>
+                    {s.visible ? '已开启' : '未开启'}
+                  </span>
+                </label>
+
+                {hasParams ? (
+                  <button
+                    onClick={() => toggleExpand(def.name)}
+                    style={{
+                      background: 'transparent', color: palette.faint, border: 'none',
+                      fontSize: 10, cursor: 'pointer', padding: '1px 6px',
+                    }}
+                  >
+                    ⚙ 参数 {isExpanded ? '▲ 收起' : '▼ 展开'}
+                  </button>
+                ) : null}
+              </div>
+
+              {/* Params sub-panel */}
+              {isExpanded && hasParams ? (
+                <div style={{
+                  padding: '6px 8px', marginTop: 2,
+                  borderLeft: `2px solid ${s.visible ? '#539bf5' : palette.line}`,
+                  background: 'rgba(0, 0, 0, 0.15)', borderRadius: '0 4px 4px 0',
+                }}>
+                  {def.name === 'DUAL_VIEW_HTF' ? (
+                    /* Custom Layout for Dual View HTF Patterns */
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {/* General settings (0..19) */}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                        {def.params.slice(0, 20).map((spec, idx) => renderControl(def.name, spec, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input))}
+                      </div>
+
+                      {/* Pattern filtering box (20..38) */}
+                      <div style={{
+                        display: 'flex', flexDirection: 'column', gap: 6, padding: 8,
+                        background: 'rgba(255, 255, 255, 0.02)', borderRadius: 4,
+                        border: `1px solid ${palette.line}`,
+                      }}>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                          <span style={{ fontWeight: 'bold', color: palette.text }}>
+                            K线形态多空筛选 ({HTF_BULLISH_INDICES.filter(i => s.params[i] === 1).length + HTF_BEARISH_INDICES.filter(i => s.params[i] === 1).length}/19)
+                          </span>
+                          <div style={{ display: 'flex', gap: 4 }}>
+                            <button
+                              onClick={() => {
+                                const nextP = [...s.params]
+                                for (const i of HTF_BULLISH_INDICES) nextP[i] = 1
+                                setSettings(sanitizeSettings({ ...settings, [def.name]: { ...s, params: nextP } }))
+                              }}
+                              style={{ background: 'rgba(61,220,151,0.1)', color: '#3ddc97', border: '1px solid rgba(61,220,151,0.3)', borderRadius: 3, fontSize: 10, cursor: 'pointer', padding: '1px 6px' }}
+                            >🟢 全选看涨 (10)</button>
+                            <button
+                              onClick={() => {
+                                const nextP = [...s.params]
+                                for (const i of HTF_BEARISH_INDICES) nextP[i] = 1
+                                setSettings(sanitizeSettings({ ...settings, [def.name]: { ...s, params: nextP } }))
+                              }}
+                              style={{ background: 'rgba(244,112,103,0.1)', color: '#f47067', border: '1px solid rgba(244,112,103,0.3)', borderRadius: 3, fontSize: 10, cursor: 'pointer', padding: '1px 6px' }}
+                            >🔴 全选看跌 (9)</button>
+                            <button
+                              onClick={() => {
+                                const nextP = [...s.params]
+                                for (let i = 20; i <= 38; i++) nextP[i] = 1
+                                setSettings(sanitizeSettings({ ...settings, [def.name]: { ...s, params: nextP } }))
+                              }}
+                              style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 3, fontSize: 10, cursor: 'pointer', padding: '1px 6px' }}
+                            >全部开启</button>
+                            <button
+                              onClick={() => {
+                                const nextP = [...s.params]
+                                for (let i = 20; i <= 38; i++) nextP[i] = 0
+                                setSettings(sanitizeSettings({ ...settings, [def.name]: { ...s, params: nextP } }))
+                              }}
+                              style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 3, fontSize: 10, cursor: 'pointer', padding: '1px 6px' }}
+                            >全部关闭</button>
+                          </div>
+                        </div>
+
+                        {/* Two columns: Bullish / Bearish */}
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 8 }}>
+                          {/* Bullish column */}
+                          <div style={{
+                            display: 'flex', flexDirection: 'column', gap: 4, padding: 6,
+                            background: 'rgba(61, 220, 151, 0.04)', borderRadius: 4,
+                            border: '1px solid rgba(61, 220, 151, 0.15)',
+                          }}>
+                            <span style={{ color: '#3ddc97', fontWeight: 'bold', fontSize: 10 }}>🟢 看涨形态 (10项)</span>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                              {HTF_BULLISH_INDICES.map(idx => renderControl(def.name, def.params[idx]!, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input))}
+                            </div>
+                          </div>
+
+                          {/* Bearish column */}
+                          <div style={{
+                            display: 'flex', flexDirection: 'column', gap: 4, padding: 6,
+                            background: 'rgba(244, 112, 103, 0.04)', borderRadius: 4,
+                            border: '1px solid rgba(244, 112, 103, 0.15)',
+                          }}>
+                            <span style={{ color: '#f47067', fontWeight: 'bold', fontSize: 10 }}>🔴 看跌形态 (9项)</span>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                              {HTF_BEARISH_INDICES.map(idx => renderControl(def.name, def.params[idx]!, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Display & style settings (39..end) */}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                        {def.params.slice(39).map((spec, relIdx) => {
+                          const idx = 39 + relIdx
+                          return renderControl(def.name, spec, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input)
+                        })}
+                      </div>
+                    </div>
+                  ) : def.name === 'AICOIN_KPATTERN' ? (
+                    /* AiCoin K线形态: display options, bullish / bearish groups (show + colour), alertconditions */
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                        {[KP_THEME, KP_MODE, KP_FORMING, KP_LAST, KP_FONT, ...(s.params[KP_THEME] === 1 ? [] : [KP_BG_ON, KP_BG_COLOR])]
+                          .map(idx => renderControl(def.name, def.params[idx]!, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input))}
+                      </div>
+                      {([['看涨 · 标在低点下方', KP_BULL_INDICES, palette.up], ['看跌 · 标在高点上方', KP_BEAR_INDICES, palette.down]] as const).map(([label, group, tone]) => (
+                        <div key={label} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, padding: 6, border: `1px solid ${palette.line}`, borderRadius: 4 }}>
+                          <span style={{ color: tone, fontWeight: 'bold' }}>{label} ({group.filter(n => s.params[KP_SHOW + n] === 1).length}/{group.length})</span>
+                          {([['全开', 1], ['全关', 0]] as const).map(([text, v]) => (
+                            <button key={text} style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 3, fontSize: 10, cursor: 'pointer', padding: '1px 6px' }} onClick={() => {
+                              const next = [...s.params]
+                              for (const n of group) next[KP_SHOW + n] = v
+                              setSettings(sanitizeSettings({ ...settings, [def.name]: { ...s, params: next } }))
+                            }}>{text}</button>
+                          ))}
+                          {group.map(n => (
+                            <span key={n} style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                              {renderControl(def.name, def.params[KP_SHOW + n]!, KP_SHOW + n, s.params[KP_SHOW + n]!, s.params, commit, setSettings, settings, palette, input)}
+                              {s.params[KP_THEME] === 1 ? null : renderControl(def.name, { ...def.params[KP_COLOR + n]!, label: '' }, KP_COLOR + n, s.params[KP_COLOR + n]!, s.params, commit, setSettings, settings, palette, input)}
+                            </span>
+                          ))}
+                        </div>
+                      ))}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, padding: 6, border: `1px solid ${palette.line}`, borderRadius: 4 }}>
+                        <span style={{ color: '#539bf5', fontWeight: 'bold' }}>
+                          百度股市通 / TradingCentral 形态 ({KP_BAIDU_PLOTS.filter((_, n) => s.params[KP_BAIDU_SHOW + n] === 1).length}/{KP_BAIDU_PLOTS.length})
+                        </span>
+                        {([['全选看涨', KP_BAIDU_BULL_INDICES, 1], ['全选看跌', KP_BAIDU_BEAR_INDICES, 1], ['全开', KP_BAIDU_PLOTS.map((_, n) => n), 1], ['全关', KP_BAIDU_PLOTS.map((_, n) => n), 0]] as const).map(([text, list, v]) => (
+                          <button key={text} style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 3, fontSize: 10, cursor: 'pointer', padding: '1px 6px' }} onClick={() => {
+                            const next = [...s.params]
+                            for (const n of list) next[KP_BAIDU_SHOW + n] = v
+                            setSettings(sanitizeSettings({ ...settings, [def.name]: { ...s, params: next } }))
+                          }}>{text}</button>
+                        ))}
+                        {KP_BAIDU_PLOTS.map((_, n) =>
+                          renderControl(def.name, def.params[KP_BAIDU_SHOW + n]!, KP_BAIDU_SHOW + n, s.params[KP_BAIDU_SHOW + n]!, s.params, commit, setSettings, settings, palette, input)
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                        {KP_ALERTS.map((_, k) => renderControl(def.name, def.params[KP_ALERT + k]!, KP_ALERT + k, s.params[KP_ALERT + k]!, s.params, commit, setSettings, settings, palette, input))}
+                      </div>
+                    </div>
+                  ) : def.name === 'AICOIN_TD' ? (
+                    /* AiCoin TD: 1:1 with AiCoin 显示 dialog (仅显示9和13 / 回落点(卖出结构) / 反弹点(买入结构)) + optional mode/alerts */
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div style={{
+                        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, padding: '6px 8px',
+                        border: `1px solid ${palette.line}`, borderRadius: 4, background: 'rgba(255,255,255,0.02)',
+                      }}>
+                        <span style={{ color: palette.text, fontWeight: 600 }}>显示</span>
+                        {renderControl(def.name, def.params[7]!, 7, s.params[7]!, s.params, commit, setSettings, settings, palette, input)}
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          {renderControl(def.name, def.params[0]!, 0, s.params[0]!, s.params, commit, setSettings, settings, palette, input)}
+                          {renderControl(def.name, def.params[1]!, 1, s.params[1]!, s.params, commit, setSettings, settings, palette, input)}
+                        </span>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          {renderControl(def.name, def.params[3]!, 3, s.params[3]!, s.params, commit, setSettings, settings, palette, input)}
+                          {renderControl(def.name, def.params[4]!, 4, s.params[4]!, s.params, commit, setSettings, settings, palette, input)}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, opacity: 0.88 }}>
+                        {[6, 8, 9, 10, 11, ...(s.params[6] !== 0 ? [2, 5] : [])].map(idx =>
+                          renderControl(def.name, def.params[idx]!, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input)
+                        )}
+                      </div>
+                    </div>
+                  ) : def.name === 'NW_TREND' ? (
+                    /* Nadaraya-Watson Trend [QuantAlgo] — grouped 1:1 with TradingView Pine v6 dialog */
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {([
+                        ['预设', [0]],
+                        ['核回归设置 (Kernel Settings)', [1, 2, 3, 4, 5, 6]],
+                        ['通道与信号 (Bands & Signals)', [7, 8, 9, 10]],
+                        ['配色与视觉 (Coloring & Visuals)', [11, 12, 13, 14, 15, 16, 17]],
+                        ['警报条件 (Alert Conditions)', [18, 19, 20, 21, 22]],
+                      ] as const).map(([groupTitle, indices]) => (
+                        <div key={groupTitle} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, padding: '5px 8px', border: `1px solid ${palette.line}`, borderRadius: 4, background: 'rgba(255,255,255,0.015)' }}>
+                          <span style={{ color: palette.text, fontWeight: 600, marginRight: 4 }}>{groupTitle}</span>
+                          {indices.map(idx => renderControl(def.name, def.params[idx]!, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input))}
+                        </div>
+                      ))}
+                    </div>
+                  ) : def.name === 'REVPOINT' ? (
+                    /* 反转点标注 RevPoint v6.5 — grouped 1:1 with TradingView Pine v6 dialog */
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {([
+                        ['确认阈值', [0, 1, 9, 10, 11]],
+                        ['量能 · OI', [12, 13, 14, 15]],
+                        ['过滤 · 显示', [8, 16, 17]],
+                        ['多周期趋势线 (自动高低点)', [18, 3, 4, 5, 6, 7, 2, 19, 20, 21, 22, 23, 24]],
+                        ['警报条件 (Alert Conditions)', [25, 26, 27]],
+                      ] as const).map(([groupTitle, indices]) => (
+                        <div key={groupTitle} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, padding: '5px 8px', border: `1px solid ${palette.line}`, borderRadius: 4, background: 'rgba(255,255,255,0.015)' }}>
+                          <span style={{ color: palette.text, fontWeight: 600, marginRight: 4 }}>{groupTitle}</span>
+                          {indices.map(idx => renderControl(def.name, def.params[idx]!, idx, s.params[idx]!, s.params, commit, setSettings, settings, palette, input))}
+                        </div>
+                      ))}
+                    </div>
+                  ) : def.name === 'RSI_GRID' ? (
+                    /* Custom Layout for Dual-Direction RSI Grid */
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                        {def.params.map((spec, i) => renderControl(def.name, spec, i, s.params[i]!, s.params, commit, setSettings, settings, palette, input))}
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 2, fontSize: 10 }}>
+                        <span style={{ color: '#3ddc97', background: 'rgba(61,220,151,0.08)', padding: '2px 6px', borderRadius: 3, border: '1px solid rgba(61,220,151,0.2)' }}>
+                          🟢 多头网格: RSI &lt; {s.params[1] ?? 30} 累计超卖 &gt; {s.params[3] ?? 10} 进多 | ≥ {s.params[2] ?? 60} 止盈
+                        </span>
+                        <span style={{ color: '#f47067', background: 'rgba(244,112,103,0.08)', padding: '2px 6px', borderRadius: 3, border: '1px solid rgba(244,112,103,0.2)' }}>
+                          🔴 空头网格: RSI &gt; {100 - (s.params[2] ?? 60)} 累计超买 &gt; {s.params[3] ?? 10} 进空 | ≤ {100 - (s.params[1] ?? 30)} 止盈
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Standard Indicator Params */
+                    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                      {def.params.map((spec, i) => renderControl(def.name, spec, i, s.params[i]!, s.params, commit, setSettings, settings, palette, input))}
+                    </div>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Footer action bar */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderTop: `1px solid ${palette.line}`, paddingTop: 6, marginTop: 4 }}>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button
+            onClick={() => setAllExpanded(true)}
+            style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 4, fontSize: 11, cursor: 'pointer', padding: '2px 8px' }}
+          >全部展开</button>
+          <button
+            onClick={() => setAllExpanded(false)}
+            style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 4, fontSize: 11, cursor: 'pointer', padding: '2px 8px' }}
+          >全部折叠</button>
+          <button
+            onClick={() => setSettings(sanitizeSettings(null))}
+            style={{ background: 'transparent', color: palette.faint, border: `1px solid ${palette.line}`, borderRadius: 4, fontSize: 11, cursor: 'pointer', padding: '2px 8px' }}
+          >恢复默认</button>
+        </div>
+        <button
+          onClick={onClose}
+          style={{ background: 'rgba(83, 155, 245, 0.1)', color: '#539bf5', border: '1px solid rgba(83, 155, 245, 0.3)', borderRadius: 4, fontSize: 11, cursor: 'pointer', padding: '2px 12px', fontWeight: 'bold' }}
+        >完成并收起</button>
+      </div>
+    </div>
+  )
+}
+
+function renderControl(
+  defName: string,
+  spec: ParamSpec,
+  i: number,
+  val: number,
+  params: number[],
+  commit: (name: string, i: number, raw: string, el: HTMLInputElement) => void,
+  setSettings: (s: IndicatorSettings) => void,
+  settings: IndicatorSettings,
+  palette: Palette,
+  input: CSSProperties
+): JSX.Element {
+  const set = (v: number): void => {
+    const next = [...params]; next[i] = v
+    setSettings(sanitizeSettings({ ...settings, [defName]: { ...settings[defName]!, params: next } }))
+  }
+  const lab = { display: 'flex', alignItems: 'center', gap: 4, color: palette.faint } as const
+  if (spec.kind === 'select') return (
+    <label key={`${defName}-${i}`} style={lab}>{spec.label}
+      <select value={val} onChange={e => set(Number(e.target.value))} style={{ ...input, width: 'auto' }}>
+        {(spec.options ?? []).map((o, k) => <option key={k} value={k}>{o}</option>)}
+      </select>
+    </label>)
+  if (spec.kind === 'bool') return (
+    <label key={`${defName}-${i}`} style={lab}>
+      <input type="checkbox" checked={val === 1} onChange={e => set(e.target.checked ? 1 : 0)} />{spec.label}
+    </label>)
+  if (spec.kind === 'color') return (
+    <label key={`${defName}-${i}`} style={lab}>{spec.label}
+      <input type="color" value={intToHex(val).toLowerCase()} onChange={e => set(parseInt(e.target.value.slice(1), 16))}
+        style={{ width: 28, height: 18, padding: 0, border: `1px solid ${palette.line}`, background: 'transparent' }} />
+    </label>)
+  return (
+    <label key={`${defName}-${i}-${val}`} style={lab}>
+      {spec.label}
+      <input
+        type="number"
+        defaultValue={val}
+        min={spec.min}
+        max={spec.max}
+        step={spec.step}
+        style={input}
+        onBlur={e => commit(defName, i, e.target.value, e.target)}
+        onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
+      />
+    </label>
+  )
+}
+
+const CHIPS_STORAGE_KEY = 'dsh-trading.active-chips.v2'
+function getInitialActiveChips(): string[] {
+  try {
+    const raw = localStorage.getItem(CHIPS_STORAGE_KEY)
+    if (raw) {
+      const arr = JSON.parse(raw)
+      if (Array.isArray(arr)) {
+        return arr.filter(id => typeof id === 'string' && CHIP_DEFS.some(d => d.id === id))
+      }
+    }
+  } catch {}
+  return ['vol']
+}
+
+export function ChartBody({ payload, chartHeight = CHART_HEIGHT, shell = SHELL, fill = false, prose = true, derivatives, cvd, largeWalls, wallMarket = 'all', onCrosshairHover, history, forceChips, overlay }: {
+  payload: ChartPayload
+  /** A walkthrough section's panes: replace the reader's chips for as long as it speaks. */
+  forceChips?: string[] | undefined
+  overlay?: ((ready: KlineReady) => ReactNode) | undefined
+  history?: ChartHistory | undefined
+  chartHeight?: number
+  shell?: CSSProperties
+  fill?: boolean
+  prose?: boolean
+  derivatives?: PanelDerivatives | null
+  cvd?: PanelCvdBar[] | null
+  largeWalls?: PanelLargeOrders | null
+  wallMarket?: WallMarketFilter
+  onCrosshairHover?: (timestamp: number | null) => void
+}): JSX.Element {
+  const dark = useDark()
+  const [activeTf, setActiveTf] = useState(0)
+  const [activeChips, setActiveChips] = useState<string[]>(getInitialActiveChips)
+  const settings = useSyncExternalStore(subscribeSettings, getSettings)
+  const [editing, setEditing] = useState(false)
+  const axisSettings = useSyncExternalStore(subscribeAxisSettings, getAxisSettings, () => DEFAULT_AXIS_SETTINGS)
+  const [showAxisMenu, setShowAxisMenu] = useState(false)
+  const [chartApi, setChartApi] = useState<Chart | null>(null)
+  const [drawBarOpen, setDrawBarOpen] = useState(true)
+  const fullscreenRef = useRef<HTMLDivElement>(null)
+  // Left edge the rebuild key keeps while loadMore prepends history: `prepended`
+  // is the first bar time the canvas itself produced, `edge` the original one.
+  const historyEdge = useRef<{ prepended: string; edge: string } | null>(null)
+  const historyForKline = useMemo<ChartHistory | undefined>(() => history === undefined ? undefined : {
+    load: history.load,
+    commit: (older) => {
+      const first = older[0]?.time
+      const cur = historyEdge.current
+      const edge = cur?.edge ?? rawTfEdge.current
+      if (first !== undefined && edge !== undefined) historyEdge.current = { prepended: first, edge }
+      history.commit(older)
+    },
+  }, [history])
+  const rawTfEdge = useRef<string | undefined>(undefined)
+
+  const rawTf = payload.timeframes[Math.min(activeTf, payload.timeframes.length - 1)]
+  const tf = useMemo(() => {
+    if (!rawTf) return undefined
+    return enrichChartTimeframe(rawTf)
+  }, [rawTf])
+  const activeKey = useMemo(() => [...(forceChips ?? activeChips)].sort().join(','), [forceChips, activeChips])
+  const activeList = useMemo(() => activeKey === '' ? [] : activeKey.split(','), [activeKey])
+  const scenarios = useMemo(() => payload.scenarios ?? [], [payload])
+
+  if (tf === undefined) {
+    return <Fallback text={`${payload.symbol}: no timeframes in payload`} error={false} />
+  }
+
+  const last = tf.candles[tf.candles.length - 1]!
+  const first = tf.candles[0]!
+  const changePct = get(tf.indicators, 'changePct')
+  const palette = dark ? DARK : LIGHT
+  const chromeIndicators: ChromeIndicator[] = EDITABLE.map(def => ({
+    name: def.name,
+    title: def.title,
+    visible: settings[def.name]?.visible ?? false,
+    group: def.pane !== undefined ? 'sub' : 'main',
+  }))
+  // Chip-only indicators (not in EDITABLE): show under 副图 / 主图 in the quick modal.
+  const chromeChips: ChromeChip[] = [
+    { id: 'bb', title: '布林带', on: activeChips.includes('bb') },
+    { id: 'macd', title: 'MACD', on: activeChips.includes('macd') },
+    { id: 'stoch', title: '随机指标', on: activeChips.includes('stoch') },
+    { id: 'adx', title: 'ADX', on: activeChips.includes('adx') },
+    { id: 'mfi', title: 'MFI', on: activeChips.includes('mfi') },
+  ]
+  const toggle = (id: string): void => {
+    if (id === 'rsi') {
+      const cur = settings['RSI_GRID']!
+      setSettings({ ...settings, RSI_GRID: { ...cur, visible: !cur.visible } })
+      return
+    }
+    if (id === 'vol') {
+      const cur = settings['VOL_TIER']
+      if (cur) setSettings({ ...settings, VOL_TIER: { ...cur, visible: !cur.visible } })
+      return
+    }
+    setActiveChips(prev => {
+      let next: string[]
+      if (prev.includes(id)) {
+        next = prev.filter(x => x !== id)
+      } else {
+        next = [...prev, id]
+      }
+      try { localStorage.setItem(CHIPS_STORAGE_KEY, JSON.stringify(next)) } catch {}
+      return next
+    })
+  }
+
+  const chipRow = tf.indicators === null ? [] : CHIP_DEFS.flatMap((def) => {
+    const { text, state } = def.label(tf.indicators!)
+    if (typeof state !== 'string' || state === '') return []
+    const togglable = def.indicator !== undefined && (def.indicator.builtIn === true || hasSeries(tf, def.indicator.figures))
+    return [{ id: def.id, text: `${text} · ${zhState(state)}`, togglable, on: def.id === 'rsi' ? (settings['RSI_GRID']?.visible ?? false) : def.id === 'vol' ? (settings['VOL_TIER']?.visible ?? false) : activeChips.includes(def.id) }]
+  })
+
+  const annotationsList = tf.annotations ?? []
+  const rowColors = assignAnnotationColors(annotationsList, palette)
+  const rows = annotationsList
+    .map((a, i) => annotationRow(a, last.close, palette, rowColors[i]))
+    .filter((r): r is NonNullable<typeof r> => r !== null)
+
+  // What counts as "a different chart" for rebuild purposes: the instrument,
+  // the interval, and the exact marks drawn on it. A tail tick changes none of
+  // these, which is why a live poll does not rebuild the canvas — `withCandles`
+  // spreads `{ ...tf, candles }`, so the annotations array keeps its identity.
+  //
+  // Deliberately a plain call, not a useMemo: these lines sit after an early
+  // return, and a hook past a conditional return breaks the rules of hooks.
+  // The series' LEFT EDGE is in the key too. Without it, swapping one window
+  // for another of the same instrument, interval and marks — exactly what
+  // happens when the panel replaces the agent's 200-bar payload with the
+  // user's 1000-bar series — produces a byte-identical key, so the init effect
+  // never re-runs, applyNewData is never called, and the canvas keeps the old
+  // candles under the new caption. A live tail cannot change this value:
+  // mergeTail only replaces the forming bar or appends a new one.
+  const firstTime = tf.candles[0]?.time ?? ''
+  const he = historyEdge.current
+  const keyEdge = he !== null && he.prepended === firstTime ? he.edge : firstTime
+  if (he !== null && he.prepended !== firstTime) historyEdge.current = null
+  rawTfEdge.current = keyEdge
+  const seriesKey = `${payload.provider}|${payload.symbol}|${tf.timeframe}|${keyEdge}`
+  const marksKey = annotationDigest(tf.annotations, scenarios)
+
+  const root: CSSProperties = fill
+    ? { ...shell, display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }
+    : shell
+
+  return (
+    <div ref={fullscreenRef} style={root}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 8, marginBottom: 8, flex: '0 0 auto' }}>
+        <strong style={{ fontSize: 13 }}>{payload.symbol}</strong>
+        <span style={{ color: palette.faint }}>{tf.timeframe} · {tf.candles.length} 根 · {payload.provider}</span>
+        <span>收 {last.close}</span>
+        {typeof changePct === 'number' && Number.isFinite(changePct)
+          ? <span style={{ color: changePct >= 0 ? palette.up : palette.down }}>
+              {changePct >= 0 ? '+' : ''}{changePct}%
+            </span>
+          : null}
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ position: 'relative', display: 'inline-block' }}>
+            <button
+              onClick={() => setShowAxisMenu(m => !m)}
+              aria-expanded={showAxisMenu}
+              style={{
+                border: `1px solid ${showAxisMenu ? palette.text : palette.line}`,
+                background: 'transparent', color: 'inherit', borderRadius: 4,
+                padding: '1px 8px', fontSize: 11, cursor: 'pointer',
+              }}
+            >📐 坐标</button>
+            {showAxisMenu ? (
+              <AxisMenu
+                settings={axisSettings}
+                palette={palette}
+                onChange={(next) => setAxisSettings(next)}
+                onClose={() => setShowAxisMenu(false)}
+              />
+            ) : null}
+          </div>
+          <button
+            onClick={() => setEditing(e => !e)}
+            aria-expanded={editing}
+            style={{
+              border: `1px solid ${editing ? palette.text : palette.line}`,
+              background: 'transparent', color: 'inherit', borderRadius: 4,
+              padding: '1px 8px', fontSize: 11, cursor: 'pointer',
+            }}
+          >⚙ 指标参数</button>
+          <ChartChrome
+            chart={chartApi}
+            dark={dark}
+            palette={palette}
+            fullscreenRef={fullscreenRef}
+            indicators={chromeIndicators}
+            chips={chromeChips}
+            onToggleIndicator={(name) => {
+              const cur = settings[name]
+              if (!cur) return
+              setSettings({ ...settings, [name]: { ...cur, visible: !cur.visible } })
+            }}
+            onToggleChip={(id) => toggle(id)}
+            onOpenParams={() => setEditing(true)}
+            drawBarOpen={drawBarOpen}
+            onToggleDrawBar={() => setDrawBarOpen(v => !v)}
+          />
+        </div>
+        {payload.timeframes.length > 1
+          ? <span style={{ display: 'flex', gap: 4 }}>
+              {payload.timeframes.map((t, i) => (
+                <button
+                  key={t.timeframe}
+                  onClick={() => setActiveTf(i)}
+                  style={{
+                    border: `1px solid ${i === activeTf ? palette.text : palette.line}`,
+                    background: 'transparent', color: 'inherit', borderRadius: 4,
+                    padding: '1px 8px', fontSize: 11, cursor: 'pointer',
+                  }}
+                >{t.timeframe}</button>
+              ))}
+            </span>
+          : null}
+      </div>
+      {editing ? <ParamEditor settings={settings} palette={palette} onClose={() => setEditing(false)} /> : null}
+      <Kline
+        key={seriesKey}
+        data={tf}
+        scenarios={scenarios}
+        dark={dark}
+        active={activeList}
+        seriesKey={seriesKey}
+        marksKey={marksKey}
+        settings={settings}
+        axisSettings={axisSettings}
+        derivatives={derivatives}
+        cvd={cvd}
+        largeWalls={largeWalls}
+        wallMarket={wallMarket}
+        onCrosshairHover={onCrosshairHover}
+        history={historyForKline}
+        onEditParams={() => setEditing(true)}
+        onChartReady={setChartApi}
+        drawBarOpen={drawBarOpen}
+        baseHeight={chartHeight}
+        fill={fill}
+        forced={forceChips !== undefined}
+        overlay={overlay}
+      />
+      <div style={fill ? { flex: '0 1 auto', minHeight: 0, overflowY: 'auto' } : undefined}>
+      {chipRow.length > 0
+        ? <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+            {chipRow.map(chip => chip.togglable
+              ? <button
+                  key={chip.id}
+                  onClick={() => toggle(chip.id)}
+                  aria-pressed={chip.on}
+                  style={{
+                    border: `1px solid ${chip.on ? palette.up : palette.line}`,
+                    background: chip.on ? `${palette.up}22` : 'transparent',
+                    color: chip.on ? palette.up : palette.text,
+                    borderRadius: 99, padding: '1px 8px', fontSize: 11, cursor: 'pointer',
+                  }}
+                >{chip.text}</button>
+              : <span
+                  key={chip.id}
+                  style={{
+                    border: `1px solid ${palette.line}`, borderRadius: 99,
+                    padding: '1px 8px', fontSize: 11, color: palette.faint,
+                  }}
+                >{chip.text}</span>)}
+          </div>
+        : null}
+      {prose && rows.length > 0
+        ? <table style={{ width: '100%', marginTop: 10, borderCollapse: 'collapse', fontSize: 11.5 }}>
+            <tbody>
+              {rows.map(row => (
+                <tr key={row.key} style={{ borderTop: `1px solid ${palette.line}` }}>
+                  <td style={{ padding: '4px 8px 4px 0', whiteSpace: 'nowrap' }}>
+                    <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 99, background: row.color, marginRight: 6 }} />
+                    {row.label}
+                  </td>
+                  <td style={{ padding: '4px 8px', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>{row.where}</td>
+                  <td style={{ padding: '4px 8px', whiteSpace: 'nowrap', color: palette.faint, fontVariantNumeric: 'tabular-nums' }}>{row.distance}</td>
+                  <td style={{ padding: '4px 0 4px 8px', color: palette.faint }}>{row.sources}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        : null}
+      {prose && scenarios.length > 0
+        ? <div style={{ display: 'grid', gap: 6, marginTop: 10 }}>
+            {scenarios.map((s, i) => (
+              <div
+                key={i}
+                style={{
+                  borderLeft: `3px solid ${s.direction === 'bull' ? palette.up : palette.down}`,
+                  background: `${s.direction === 'bull' ? palette.up : palette.down}11`,
+                  borderRadius: 4, padding: '6px 10px',
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                  <span style={{ color: s.direction === 'bull' ? palette.up : palette.down }}>
+                    {s.direction === 'bull' ? '看多' : '看空'}
+                  </span>
+                  <span style={{
+                    marginLeft: 6, fontSize: 10, letterSpacing: 0.5, color: palette.faint,
+                    border: `1px solid ${palette.line}`, borderRadius: 3, padding: '0 4px',
+                  }}>{s.stance === 'base' ? '主' : '备'}</span>
+                  <span style={{ marginLeft: 8, fontWeight: 400 }}>{s.thesis}</span>
+                </div>
+                <div style={{ color: palette.faint, fontSize: 11 }}>
+                  触发：{s.trigger}{s.triggerPrice !== undefined ? ` (${s.triggerPrice})` : ''}
+                  {' · '}失效：{s.invalidation}{s.invalidationPrice !== undefined ? ` (${s.invalidationPrice})` : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+        : null}
+      <div style={{ color: palette.faint, marginTop: 6, fontSize: 11 }}>
+        {first.time} … {last.time} · 点击标签开关对应指标副图
+        {prose ? ' · 情景为研究假设，非交易建议' : ''}
+      </div>
+      </div>
+    </div>
+  )
+}
+
+/** Only tool-call cards use this gate; the persistent panel stays mounted. */
+function ViewportChartCard({ payload }: { payload: ChartPayload }): JSX.Element {
+  const root = useRef<HTMLDivElement>(null)
+  const [near, setNear] = useState(() => initialChartMount(typeof IntersectionObserver !== 'undefined'))
+  const [parkedHeight, setParkedHeight] = useState(0)
+
+  useEffect(() => {
+    const target = root.current
+    if (target === null) return
+    return observeNearViewport(target, (visible, height) => {
+      if (!visible && height !== undefined && height > 0) setParkedHeight(height)
+      setNear(current => current === visible ? current : visible)
+    })
+  }, [])
+
+  return (
+    <div ref={root} data-chart-card-viewport style={near ? undefined : { height: Math.max(parkedHeight, CHART_HEIGHT), boxSizing: 'border-box' }}>
+      {near ? <ChartBody payload={payload} /> : (
+        <div style={{ ...SHELL, boxSizing: 'border-box', height: '100%', margin: 0 }}>
+          {payload.symbol} · 图表已暂停，滚动至附近恢复
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The tool-call seat's adapter: unwrap a `market_snapshot` / `get_ohlcv` /
+ * `annotate_chart` result into a payload and hand it to {@link ChartBody},
+ * degrading to the rendered text when the payload is absent.
+ *
+ * It also PUBLISHES each payload it sees to the latest-chart store, which is
+ * what lifts the model's chart out of the chat bubble and into the frame's
+ * persistent column. Publishing from render (via an effect) rather than from
+ * the tool pipeline keeps the seam one-directional: the panel never reaches
+ * into conversation state, it just mirrors whatever card rendered last.
+ */
+export function ChartCard(props: ToolCallViewProps): JSX.Element {
+  const { block, toolName } = props
+  const settled = 'kind' in block
+  const payload = settled && !block.isError ? readChartPayload(block.meta) : null
+  const publishPayload = useMemo(
+    () => payload ?? (settled && !block.isError ? readCallFallbackPayload((block as { call?: unknown }).call) : null),
+    [payload, settled, block],
+  )
+
+  // Publishing stays ABOVE every early return: the column must still receive the
+  // chart when the card itself collapses to a receipt.
+  useEffect(() => {
+    if (publishPayload !== null) publishLatestChart(publishPayload)
+  }, [publishPayload])
+
+  const columnOpen = useSyncExternalStore(subscribeColumn, getColumnOpen, getColumnOpen)
+  const [expanded, setExpanded] = useState(false)
+
+  if (!settled) {
+    return <div style={SHELL}>{toolName} …</div>
+  }
+  if (block.isError) {
+    return <Fallback text={contentText(block.content) || `${toolName} failed`} error />
+  }
+  if (payload === null) {
+    return <Fallback text={contentText(block.content)} error={false} />
+  }
+  if (cardView(columnOpen, expanded) === 'receipt') {
+    return (
+      <div style={RECEIPT} data-chart-receipt>
+        <span>{chartReceipt(toolName, payload)}</span>
+        <button type="button" style={RECEIPT_BUTTON} onClick={() => setExpanded(true)}>展开图表</button>
+      </div>
+    )
+  }
+  return <ViewportChartCard payload={payload} />
+}

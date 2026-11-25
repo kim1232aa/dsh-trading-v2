@@ -1,99 +1,83 @@
 #!/usr/bin/env node
 /**
  * Tools Schema & Collision Audit Guard.
- * Inspects all Cordis tool definitions across the monorepo to ensure:
- * 1. Zero namespace collisions across packages.
+ * Inspects all Cordis tool definitions across src/ to ensure:
+ * 1. Zero namespace collisions.
  * 2. Proper naming conventions (snake_case).
  * 3. Detailed descriptions and valid parameter schemas.
- *
- * @module scripts/tools-audit
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 const ROOT_DIR = process.cwd()
-const PACKAGES_DIR = join(ROOT_DIR, 'packages')
+const SRC_DIR = join(ROOT_DIR, 'src')
 
-function scanPackageFiles(dir) {
+function scanFiles(dir) {
   const files = []
-  try {
-    const entries = readdirSync(dir, { withFileTypes: true })
-    for (const entry of entries) {
-      const full = join(dir, entry.name)
-      if (entry.isDirectory() && entry.name !== 'node_modules' && entry.name !== 'lib' && entry.name !== 'test') {
-        files.push(...scanPackageFiles(full))
-      } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))) {
-        files.push(full)
+  if (!existsSync(dir)) return files
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      if (entry.name !== 'node_modules' && entry.name !== 'lib' && entry.name !== 'client') {
+        files.push(...scanFiles(full))
       }
+    } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))) {
+      files.push(full)
     }
-  } catch {
-    // skip non-existent
   }
   return files
 }
 
 function auditTools() {
-  console.log('🔍 [Tools Audit Guard] Scanning all tool definitions across monorepo...\n')
+  console.log('🔍 [Tools Audit Guard] Scanning all tool definitions across src/...\n')
 
-  const packages = readdirSync(PACKAGES_DIR, { withFileTypes: true })
+  const files = scanFiles(SRC_DIR)
   const toolRegistry = new Map()
   const errors = []
 
-  for (const pkg of packages) {
-    if (!pkg.isDirectory()) continue
-    const pkgSrc = join(PACKAGES_DIR, pkg.name, 'src')
-    if (!existsSync(pkgSrc)) continue
-    const files = scanPackageFiles(pkgSrc)
+  for (const file of files) {
+    const content = readFileSync(file, 'utf-8')
+    const rel = relative(ROOT_DIR, file).replace(/\\/g, '/')
+    const toolMatchRegex = /defineTool\(\s*\{[\s\S]*?name:\s*['"`]([a-z0-9_]+)['"`][\s\S]*?description:\s*([\s\S]*?)[,\n]\s*(?:parameters|output):/g
+    let match
 
-    for (const file of files) {
-      const content = readFileSync(file, 'utf-8')
+    while ((match = toolMatchRegex.exec(content)) !== null) {
+      const name = match[1]
+      const rawDesc = match[2].trim()
+      const description = rawDesc.replace(/['"`+\s\n]+/g, ' ').trim()
 
-      // Match defineTool({ name: '...', description: '...' }) or ctx.tools.register({ name: '...' })
-      const toolMatchRegex = /defineTool\(\s*\{[\s\S]*?name:\s*['"`]([a-z0-9_]+)['"`][\s\S]*?description:\s*['"`]([\s\S]*?)['"`][,\n]/g
-      let match
-
-      while ((match = toolMatchRegex.exec(content)) !== null) {
-        const name = match[1]
-        const description = match[2].trim()
-
-        // 1. Check naming convention
-        if (!/^[a-z][a-z0-9_]*$/.test(name)) {
-          errors.push(`❌ [${pkg.name}] Tool "${name}" does not follow snake_case naming convention in ${file}`)
-        }
-
-        // 2. Check description length
-        if (description.length < 8) {
-          errors.push(`❌ [${pkg.name}] Tool "${name}" has insufficient description ("${description}") in ${file}`)
-        }
-
-        // 3. Check duplicate collision
-        if (toolRegistry.has(name)) {
-          const existing = toolRegistry.get(name)
-          errors.push(
-            `❌ [Collision] Tool "${name}" is registered in both "${existing.pkg}" (${existing.file}) and "${pkg.name}" (${file})!`,
-          )
-        } else {
-          toolRegistry.set(name, { name, description, pkg: pkg.name, file })
-        }
+      if (!/^[a-z][a-z0-9_]*$/.test(name)) {
+        errors.push(`❌ Tool "${name}" does not follow snake_case naming convention in ${rel}`)
+      }
+      if (description.length < 8) {
+        errors.push(`❌ Tool "${name}" has insufficient description in ${rel}`)
+      }
+      if (toolRegistry.has(name)) {
+        const existing = toolRegistry.get(name)
+        errors.push(`❌ [Collision] Tool "${name}" is registered in both ${existing.rel} and ${rel}!`)
+      } else {
+        toolRegistry.set(name, { name, description, rel })
       }
     }
   }
 
-  console.log(`📋 Found and validated ${toolRegistry.size} registered tools across packages:`)
+  console.log(`📋 Found and validated ${toolRegistry.size} registered tools:`)
   for (const [name, meta] of toolRegistry.entries()) {
-    console.log(`   • ${name.padEnd(24)} [@dsh-trading/${meta.pkg}]`)
+    console.log(`   • ${name.padEnd(26)} [${meta.rel}]`)
+  }
+
+  if (toolRegistry.size === 0) {
+    errors.push('❌ Zero tools discovered — audit regex or directory mismatch')
   }
 
   if (errors.length > 0) {
     console.error(`\n🚨 Tools Audit FAILED with ${errors.length} error(s):`)
-    for (const err of errors) {
-      console.error(err)
-    }
+    for (const err of errors) console.error(err)
     process.exit(1)
   }
 
-  console.log(`\n🎉 Tools Audit PASSED: All ${toolRegistry.size} tools have unique names, valid schemas, and clear descriptions!`)
+  console.log(`\n🎉 Tools Audit PASSED: All ${toolRegistry.size} tools have unique names and valid schemas!`)
 }
 
 try {

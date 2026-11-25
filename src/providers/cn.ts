@@ -1,0 +1,590 @@
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import type {
+  Candle,
+  FundamentalsPackage,
+  InstrumentInfo,
+  MarketDataProvider,
+  MoneyFlow,
+  OhlcvQuery,
+  Orderbook,
+  Timeframe,
+} from '../market-data/index.js'
+
+export const name = 'provider-cn'
+export const inject = ['marketData']
+
+export interface Config {
+  id: string
+  eastmoneyBaseURL: string
+  sinaBaseURL: string
+  tencentBaseURL: string
+  sinaMoneyFlowBaseURL: string
+  timeoutMs: number
+}
+
+export const Config: z<Config> = z.object({
+  id: z.string().default('cn'),
+  eastmoneyBaseURL: z.string().default('https://push2his.eastmoney.com'),
+  sinaBaseURL: z.string().default('https://quotes.sina.cn'),
+  tencentBaseURL: z.string().default('https://qt.gtimg.cn'),
+  sinaMoneyFlowBaseURL: z.string().default('https://vip.stock.finance.sina.com.cn'),
+  timeoutMs: z.number().min(1).default(8000).description('Per-request upstream timeout (ms).'),
+}) as unknown as z<Config>
+
+export const ALL_CN_TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '30m', '1h', '1d', '1w']
+
+const EM_KLT_MAP: Partial<Record<Timeframe, number>> = {
+  '1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '1d': 101, '1w': 102,
+}
+
+/** EM and Sina label intraday bars by their CLOSE (09:35 = the first 5m bar); the seam wants bar-open. */
+const INTRADAY_MS: Partial<Record<Timeframe, number>> = { '1m': 60e3, '5m': 300e3, '15m': 900e3, '30m': 1800e3, '1h': 3600e3 }
+
+export function toBarOpen(bars: Candle[], tf: Timeframe): Candle[] {
+  const ms = INTRADAY_MS[tf]
+  return ms === undefined ? bars : bars.map(b => ({ ...b, time: new Date(Date.parse(b.time) - ms).toISOString() }))
+}
+
+const SINA_SCALE_MAP: Partial<Record<Timeframe, number>> = {
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '1h': 60,
+  '1d': 240,
+}
+
+export interface CnSymbolInfo {
+  code: string
+  market: 'sh' | 'sz' | 'bj'
+  secid: string
+  sinaSymbol: string
+}
+
+export function parseCnSymbol(raw: string): CnSymbolInfo {
+  const s = raw.trim().replace(/[.\-_\s]/g, '')
+  const upper = s.toUpperCase()
+
+  let code = ''
+  let market: 'sh' | 'sz' | 'bj' = 'sh'
+
+  if (/^(SH|SZ|BJ)\d{6}$/i.test(upper)) {
+    const p = upper.slice(0, 2).toLowerCase() as 'sh' | 'sz' | 'bj'
+    market = p
+    code = upper.slice(2)
+  } else if (/^\d{6}(SH|SZ|BJ)$/i.test(upper)) {
+    const p = upper.slice(6).toLowerCase() as 'sh' | 'sz' | 'bj'
+    market = p
+    code = upper.slice(0, 6)
+  } else if (/^\d{6}$/.test(upper)) {
+    code = upper
+    if (code.startsWith('6') || code.startsWith('900') || code.startsWith('688') || code.startsWith('689')) {
+      market = 'sh'
+    } else if (code.startsWith('00') || code.startsWith('30') || code.startsWith('200') || code.startsWith('399')) {
+      market = 'sz'
+    } else if (code.startsWith('920') || code.startsWith('43') || code.startsWith('83') || code.startsWith('87') || code.startsWith('88')) {
+      market = 'bj'
+    } else {
+      market = 'sh'
+    }
+  } else {
+    throw new Error(`Invalid A-share symbol format: '${raw}' (expected e.g. 600519, sh600519, 000001, 300750, 920002)`)
+  }
+
+  const emPrefix = market === 'sh' ? '1.' : '0.'
+  const secid = `${emPrefix}${code}`
+  const sinaPrefix = market === 'sh' ? 'sh' : market === 'sz' ? 'sz' : 'bj'
+  const sinaSymbol = `${sinaPrefix}${code}`
+
+  return { code, market, secid, sinaSymbol }
+}
+
+export function isCnSymbol(raw: string): boolean {
+  try {
+    parseCnSymbol(raw)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Converts Beijing local market time (UTC+8) to UTC ISO-8601 string. */
+export function cnTimeToIso(timeStr: string): string {
+  const clean = timeStr.trim().replace(/[h]/g, ':')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+    return new Date(`${clean}T09:30:00+08:00`).toISOString()
+  }
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/.test(clean)) {
+    const [d, t] = clean.split(/\s+/)
+    return new Date(`${d}T${t}:00+08:00`).toISOString()
+  }
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(clean)) {
+    const [d, t] = clean.split(/\s+/)
+    return new Date(`${d}T${t}+08:00`).toISOString()
+  }
+  return new Date(clean).toISOString()
+}
+
+export function formatRmbAmount(amount: number): string {
+  const abs = Math.abs(amount)
+  const sign = amount >= 0 ? '+' : '-'
+  if (abs >= 1e8) {
+    return `${sign}${(abs / 1e8).toFixed(2)}亿`
+  }
+  if (abs >= 1e4) {
+    return `${sign}${(abs / 1e4).toFixed(1)}万`
+  }
+  return `${sign}${abs.toFixed(0)}元`
+}
+
+/** Parses raw Tencent stock quote (qt.gtimg.cn) into normalized Orderbook and Fundamentals. */
+export function parseTencentQuote(raw: string, symbol: string): {
+  orderbook: Orderbook
+  fundamentals: FundamentalsPackage
+} {
+  const match = raw.match(/"([^"]+)"/)
+  const content = match ? match[1]! : raw
+  const parts = content.split('~')
+
+  const timeRaw = parts[30] // e.g. 20261002150000
+  let isoTime = new Date().toISOString()
+  if (timeRaw && timeRaw.length === 14) {
+    isoTime = cnTimeToIso(`${timeRaw.slice(0, 4)}-${timeRaw.slice(4, 6)}-${timeRaw.slice(6, 8)} ${timeRaw.slice(8, 10)}:${timeRaw.slice(10, 12)}:${timeRaw.slice(12, 14)}`)
+  }
+
+  // Bids: Buy 1 to Buy 5 (indices 9/10, 11/12, 13/14, 15/16, 17/18)
+  const bids: Array<{ price: number; quantity: number }> = [
+    { price: Number(parts[9]) || 0, quantity: (Number(parts[10]) || 0) * 100 },
+    { price: Number(parts[11]) || 0, quantity: (Number(parts[12]) || 0) * 100 },
+    { price: Number(parts[13]) || 0, quantity: (Number(parts[14]) || 0) * 100 },
+    { price: Number(parts[15]) || 0, quantity: (Number(parts[16]) || 0) * 100 },
+    { price: Number(parts[17]) || 0, quantity: (Number(parts[18]) || 0) * 100 },
+  ].filter(b => b.price > 0)
+
+  // Asks: Sell 1 to Sell 5 (indices 19/20, 21/22, 23/24, 25/26, 27/28)
+  const asks: Array<{ price: number; quantity: number }> = [
+    { price: Number(parts[19]) || 0, quantity: (Number(parts[20]) || 0) * 100 },
+    { price: Number(parts[21]) || 0, quantity: (Number(parts[22]) || 0) * 100 },
+    { price: Number(parts[23]) || 0, quantity: (Number(parts[24]) || 0) * 100 },
+    { price: Number(parts[25]) || 0, quantity: (Number(parts[26]) || 0) * 100 },
+    { price: Number(parts[27]) || 0, quantity: (Number(parts[28]) || 0) * 100 },
+  ].filter(a => a.price > 0)
+
+  const bestBid = bids[0]?.price
+  const bestAsk = asks[0]?.price
+  const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : (Number(parts[3]) || undefined)
+  const spread = bestBid && bestAsk ? Number((bestAsk - bestBid).toFixed(4)) : undefined
+
+  // qt.gtimg.cn field map (verified 2026-10 against live quotes):
+  // 38 turnover%, 39 PE(TTM), 43 amplitude%, 44 circ mkt-cap (亿元),
+  // 45 total mkt-cap (亿元), 46 PB. Older drafts swapped 43/44/45/46.
+  const peTtm = Number(parts[39]) || undefined
+  const pb = Number(parts[46]) || undefined
+  const circulatingMarketCap = (Number(parts[44]) || 0) * 1e8 || undefined
+  const marketCap = (Number(parts[45]) || 0) * 1e8 || undefined
+  const turnoverRatio = Number(parts[38]) || undefined
+
+  return {
+    orderbook: {
+      symbol,
+      time: isoTime,
+      bids,
+      asks,
+      midPrice,
+      spread,
+    },
+    fundamentals: {
+      symbol,
+      time: isoTime,
+      peTtm,
+      pb,
+      circulatingMarketCap,
+      marketCap,
+      turnoverRatio,
+    },
+  }
+}
+
+const CN_SEARCH_ALIASES: Record<string, { symbol: string; name: string; assetClass: 'equity' | 'index' }> = {
+  上证指数: { symbol: 'sh000001', name: '上证指数', assetClass: 'index' },
+  上证: { symbol: 'sh000001', name: '上证指数', assetClass: 'index' },
+  大盘: { symbol: 'sh000001', name: '上证指数', assetClass: 'index' },
+  深证成指: { symbol: 'sz399001', name: '深证成指', assetClass: 'index' },
+  深成指: { symbol: 'sz399001', name: '深证成指', assetClass: 'index' },
+  创业板指: { symbol: 'sz399006', name: '创业板指', assetClass: 'index' },
+  创业板: { symbol: 'sz399006', name: '创业板指', assetClass: 'index' },
+  科创50: { symbol: 'sh000688', name: '科创50', assetClass: 'index' },
+  科创板: { symbol: 'sh000688', name: '科创50', assetClass: 'index' },
+  沪深300: { symbol: 'sh000300', name: '沪深300', assetClass: 'index' },
+  中证500: { symbol: 'sh000905', name: '中证500', assetClass: 'index' },
+  贵州茅台: { symbol: '600519', name: '贵州茅台', assetClass: 'equity' },
+  茅台: { symbol: '600519', name: '贵州茅台', assetClass: 'equity' },
+  maotai: { symbol: '600519', name: '贵州茅台', assetClass: 'equity' },
+  平安银行: { symbol: '000001', name: '平安银行', assetClass: 'equity' },
+  宁德时代: { symbol: '300750', name: '宁德时代', assetClass: 'equity' },
+  宁王: { symbol: '300750', name: '宁德时代', assetClass: 'equity' },
+  中芯国际: { symbol: '688981', name: '中芯国际', assetClass: 'equity' },
+  比亚迪: { symbol: '002594', name: '比亚迪', assetClass: 'equity' },
+  中国平安: { symbol: '601318', name: '中国平安', assetClass: 'equity' },
+  紫金矿业: { symbol: '601899', name: '紫金矿业', assetClass: 'equity' },
+  美的集团: { symbol: '000333', name: '美的集团', assetClass: 'equity' },
+  万达轴承: { symbol: '920002', name: '万达轴承', assetClass: 'equity' },
+}
+
+function normaliseCnCandidate(raw: string): string {
+  const trimmed = raw.trim().toUpperCase()
+  const broker = /^(SH|SZ|BJ)\.(\d{6})$/.exec(trimmed)
+  if (broker !== null) return `${broker[1]!.toLowerCase()}${broker[2]!}`
+  const suffixed = /^(\d{6})\.(SS|SH|SZ|BJ)$/.exec(trimmed)
+  if (suffixed !== null) {
+    const mkt = suffixed[2] === 'SS' ? 'sh' : suffixed[2]!.toLowerCase()
+    return `${mkt}${suffixed[1]!}`
+  }
+  return raw.trim()
+}
+export class CnMarketProvider implements MarketDataProvider {
+  readonly id: string
+  readonly description: string
+
+  private readonly representativeSymbols: InstrumentInfo[] = [
+    { symbol: '600519', assetClass: 'equity', description: '贵州茅台 (沪A)' },
+    { symbol: '000001', assetClass: 'equity', description: '平安银行 (深A)' },
+    { symbol: '300750', assetClass: 'equity', description: '宁德时代 (创业板)' },
+    { symbol: '688981', assetClass: 'equity', description: '中芯国际 (科创板)' },
+    { symbol: '002594', assetClass: 'equity', description: '比亚迪 (深A)' },
+    { symbol: '601318', assetClass: 'equity', description: '中国平安 (沪A)' },
+    { symbol: '601899', assetClass: 'equity', description: '紫金矿业 (沪A)' },
+    { symbol: '000333', assetClass: 'equity', description: '美的集团 (深A)' },
+    { symbol: '920002', assetClass: 'equity', description: '万达轴承 (北交所)' },
+    { symbol: 'sh000001', assetClass: 'index', description: '上证指数' },
+    { symbol: 'sz399001', assetClass: 'index', description: '深证成指' },
+    { symbol: 'sz399006', assetClass: 'index', description: '创业板指' },
+  ].map(s => ({ ...s, timeframes: [...ALL_CN_TIMEFRAMES] }))
+
+  constructor(
+    id: string,
+    private readonly emBaseURL: string,
+    private readonly sinaBaseURL: string,
+    private readonly tencentBaseURL: string = 'https://qt.gtimg.cn',
+    private readonly timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+    private readonly sinaMoneyFlowBaseURL: string = 'https://vip.stock.finance.sina.com.cn',
+  ) {
+    this.id = id
+    this.description = 'A股行情与资金流 (东财主源 + 新浪容灾 + 腾讯极速盘口)'
+  }
+
+  private async fetchT(input: string | URL, attempts = 2): Promise<Response> {
+    let lastErr: unknown
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await fetch(input, { signal: AbortSignal.timeout(this.timeoutMs) })
+      } catch (e) {
+        lastErr = e
+      }
+    }
+    throw lastErr
+  }
+
+  matchesSymbol(symbol: string): boolean {
+    return isCnSymbol(symbol)
+  }
+
+  async listSymbols(): Promise<InstrumentInfo[]> {
+    return this.representativeSymbols
+  }
+
+  private readonly suggestCache = new Map<string, { at: number; items: InstrumentInfo[] }>()
+
+  async search(query: string): Promise<InstrumentInfo[]> {
+    const q = query.trim()
+    if (q.length === 0 || q.length > 40) return []
+    const alias = CN_SEARCH_ALIASES[q.toLowerCase()] ?? CN_SEARCH_ALIASES[q]
+    if (alias !== undefined) {
+      return [{ symbol: alias.symbol, name: alias.name, assetClass: alias.assetClass, timeframes: [...ALL_CN_TIMEFRAMES] }]
+    }
+    try {
+      const normalized = normaliseCnCandidate(q)
+      const info = parseCnSymbol(normalized)
+      const rep = this.representativeSymbols.find(item => item.symbol.toLowerCase() === info.code || item.symbol.toLowerCase() === info.sinaSymbol)
+      if (rep !== undefined) {
+        const name = (rep as InstrumentInfo & { description?: string }).description?.split(' (')[0]
+        return [{ symbol: rep.symbol, ...(name ? { name } : {}), assetClass: rep.assetClass ?? 'equity', timeframes: [...ALL_CN_TIMEFRAMES] }]
+      }
+      const symbol = info.code.startsWith('000') && info.market === 'sh' ? info.sinaSymbol : info.code
+      return [{ symbol, assetClass: 'equity', timeframes: [...ALL_CN_TIMEFRAMES] }]
+    } catch {
+      // Fall through to Chinese stock suggest lookup
+    }
+    if (!/[\u4e00-\u9fff]/.test(q)) return []
+    const cached = this.suggestCache.get(q)
+    if (cached !== undefined && Date.now() - cached.at < 60_000) return cached.items
+    try {
+      const url = `https://searchapi.eastmoney.com/api/suggest/get?input=${encodeURIComponent(q)}&type=14&count=8`
+      const res = await fetch(url, { signal: AbortSignal.timeout(Math.min(this.timeoutMs, 4000)) })
+      if (!res.ok) return []
+      const body = (await res.json()) as { QuotationCodeTable?: { Data?: Array<{ Code?: string; Name?: string; MktNum?: string; SecurityTypeName?: string }> } }
+      const items: InstrumentInfo[] = []
+      for (const row of body.QuotationCodeTable?.Data ?? []) {
+        const code = row.Code?.trim() ?? ''
+        const name = row.Name?.trim() ?? ''
+        const sec = row.SecurityTypeName ?? ''
+        if (!/^\d{6}$/.test(code)) continue
+        const isCnBoard = row.MktNum === '0' || row.MktNum === '1' || /沪|深|京|科创|创业/.test(sec)
+        if (!isCnBoard) continue
+        const isIdx = /指数/.test(sec)
+        const symbol = isIdx ? `${row.MktNum === '1' ? 'sh' : 'sz'}${code}` : code
+        items.push({ symbol, ...(name ? { name } : {}), assetClass: isIdx ? 'index' : 'equity', timeframes: [...ALL_CN_TIMEFRAMES] })
+        if (items.length >= 8) break
+      }
+      this.suggestCache.set(q, { at: Date.now(), items })
+      if (this.suggestCache.size > 100) this.suggestCache.delete(this.suggestCache.keys().next().value as string)
+      return items
+    } catch {
+      return []
+    }
+  }
+
+  async getOhlcv(query: OhlcvQuery): Promise<Candle[]> {
+    if (!ALL_CN_TIMEFRAMES.includes(query.timeframe)) throw new Error(`A股没有 ${query.timeframe} 周期 (可用: ${ALL_CN_TIMEFRAMES.join(', ')})`)
+    const sym = parseCnSymbol(query.symbol)
+    try {
+      return toBarOpen(await this.fetchEastmoney(sym, query), query.timeframe)
+    } catch (emErr) {
+      // Gracefully fall back to Sina if Eastmoney is down or network blips
+      try {
+        return toBarOpen(await this.fetchSina(sym, query), query.timeframe)
+      } catch (sinaErr) {
+        throw new Error(`CN market data failed for '${query.symbol}': Eastmoney (${(emErr as Error).message}), Sina (${(sinaErr as Error).message})`)
+      }
+    }
+  }
+
+  private async fetchEastmoney(sym: CnSymbolInfo, query: OhlcvQuery): Promise<Candle[]> {
+    const klt = EM_KLT_MAP[query.timeframe]!
+    const limit = Math.min(query.limit ?? 200, 1000)
+
+    const url = new URL('/api/qt/stock/kline/get', this.emBaseURL)
+    url.searchParams.set('secid', sym.secid)
+    url.searchParams.set('klt', String(klt))
+    url.searchParams.set('fqt', '1') // 前复权
+    url.searchParams.set('end', '20500101') // without an end EM answers rc=102, data=null
+    url.searchParams.set('fields1', 'f1,f2,f3,f4,f5,f6')
+    url.searchParams.set('fields2', 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61')
+    url.searchParams.set('lmt', String(limit))
+
+    const res = await this.fetchT(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+    const data = await res.json() as { data?: { klines?: string[] } }
+    const rawKlines = data?.data?.klines
+    if (!rawKlines || !Array.isArray(rawKlines) || rawKlines.length === 0) {
+      throw new Error(`empty klines from Eastmoney for ${sym.secid}`)
+    }
+
+    return finiteBars(rawKlines.map(line => {
+      // format: "time,open,close,high,low,volume,amount,amplitude,changePct,changeAmount,turnover"
+      const parts = line.split(',')
+      return {
+        time: cnTimeToIso(parts[0]!),
+        open: Number(parts[1]),
+        close: Number(parts[2]),
+        high: Number(parts[3]),
+        low: Number(parts[4]),
+        volume: Number(parts[5]) * 100, // EM reports 手 (100 shares); Sina reports shares
+      }
+    }))
+  }
+
+  private async fetchSina(sym: CnSymbolInfo, query: OhlcvQuery): Promise<Candle[]> {
+    const scale = SINA_SCALE_MAP[query.timeframe]
+    if (scale === undefined) throw new Error(`新浪无 ${query.timeframe} 周期`)
+    const limit = Math.min(query.limit ?? 200, 1000)
+
+    const url = new URL(`/cn/api/jsonp_v2.php/var%20_${sym.sinaSymbol}=/CN_MarketData.getKLineData`, this.sinaBaseURL)
+    url.searchParams.set('symbol', sym.sinaSymbol)
+    url.searchParams.set('scale', String(scale))
+    url.searchParams.set('ma', 'no')
+    url.searchParams.set('datalen', String(limit))
+
+    const res = await this.fetchT(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+    const text = await res.text()
+    const jsonMatch = text.match(/\(\s*(\[.*?\])\s*\)/s)
+    if (!jsonMatch || !jsonMatch[1]) {
+      throw new Error(`invalid Sina JSONP format: ${text.slice(0, 100)}`)
+    }
+
+    const rows = JSON.parse(jsonMatch[1]) as Array<{
+      day: string
+      open: string
+      high: string
+      low: string
+      close: string
+      volume: string
+    }>
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new Error(`empty klines from Sina for ${sym.sinaSymbol}`)
+    }
+
+    return finiteBars(rows.map(r => ({
+      time: cnTimeToIso(r.day),
+      open: Number(r.open),
+      high: Number(r.high),
+      low: Number(r.low),
+      close: Number(r.close),
+      volume: Number(r.volume),
+    })))
+  }
+
+  async getMoneyFlow(symbol: string): Promise<MoneyFlow> {
+    try {
+      return await this.moneyFlowEastmoney(symbol)
+    } catch (emErr) {
+      try {
+        return await this.moneyFlowSina(symbol)
+      } catch (sinaErr) {
+        throw new Error(`CN money flow failed for '${symbol}': Eastmoney (${(emErr as Error).message}), Sina (${(sinaErr as Error).message})`)
+      }
+    }
+  }
+
+  /** Sina fallback: daily 主力净流入 trend. Only main / 超大单 legs exist there; tiers it lacks stay null. */
+  private async moneyFlowSina(symbol: string): Promise<MoneyFlow> {
+    const sym = parseCnSymbol(symbol)
+    const url = new URL('/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs', this.sinaMoneyFlowBaseURL)
+    url.searchParams.set('page', '1')
+    url.searchParams.set('num', '1')
+    url.searchParams.set('sort', 'opendate')
+    url.searchParams.set('asc', '0')
+    url.searchParams.set('daima', sym.sinaSymbol)
+    const res = await this.fetchT(url)
+    if (!res.ok) throw new Error(`Sina moneyflow HTTP ${res.status}`)
+    return parseSinaMoneyFlow(await res.text(), symbol)
+  }
+
+  private async moneyFlowEastmoney(symbol: string): Promise<MoneyFlow> {
+    const sym = parseCnSymbol(symbol)
+    const url = new URL('/api/qt/stock/fflow/kline/get', this.emBaseURL)
+    url.searchParams.set('secid', sym.secid)
+    url.searchParams.set('klt', '101')
+    url.searchParams.set('fields1', 'f1,f2,f3,f7')
+    url.searchParams.set('fields2', 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65')
+    url.searchParams.set('lmt', '5')
+
+    const res = await this.fetchT(url)
+    if (!res.ok) throw new Error(`Eastmoney fflow HTTP ${res.status}`)
+
+    const json = await res.json() as {
+      data?: {
+        name?: string
+        klines?: string[]
+      }
+    }
+
+    const klines = json?.data?.klines
+    if (!klines || klines.length === 0) {
+      throw new Error(`no money flow data returned for ${symbol}`)
+    }
+
+    // Latest kline row: "date,主力净流入,小单净流入,中单净流入,大单净流入,超大单净流入"
+    const latest = klines[klines.length - 1]!.split(',')
+    const date = latest[0]!
+    const mainNet = Number(latest[1] || 0)
+    const smallNet = Number(latest[2] || 0)
+    const mediumNet = Number(latest[3] || 0)
+    const largeNet = Number(latest[4] || 0)
+    const superLargeNet = Number(latest[5] || 0)
+
+    // Also probe quote to get turnover for ratio
+    let mainRatioPct: number | null = null
+    try {
+      const qUrl = new URL('https://push2.eastmoney.com/api/qt/stock/get')
+      qUrl.searchParams.set('secid', sym.secid)
+      qUrl.searchParams.set('fields', 'f48,f58')
+      const qRes = await this.fetchT(qUrl)
+      if (qRes.ok) {
+        const qJson = await qRes.json() as { data?: { f48?: number } }
+        const turnover = qJson?.data?.f48
+        if (turnover && turnover > 0) {
+          mainRatioPct = Number(((mainNet / turnover) * 100).toFixed(2))
+        }
+      }
+    } catch {
+      // ratio optional
+    }
+
+    const stockName = json?.data?.name ? `${json.data.name} ` : ''
+    const ratioStr = mainRatioPct !== null ? ` (${mainRatioPct >= 0 ? '+' : ''}${mainRatioPct}%)` : ''
+    const summary = `${stockName}主力净流入 ${formatRmbAmount(mainNet)}${ratioStr} | 超大单 ${formatRmbAmount(superLargeNet)} | 大单 ${formatRmbAmount(largeNet)} | 散户(中小单) ${formatRmbAmount(smallNet + mediumNet)}`
+
+    return {
+      symbol,
+      time: cnTimeToIso(date),
+      netInflow: mainNet,
+      superLargeInflow: superLargeNet,
+      largeInflow: largeNet,
+      mediumInflow: mediumNet,
+      smallInflow: smallNet,
+      mainRatioPct,
+      summary,
+    }
+  }
+
+  async getOrderbook(symbol: string): Promise<Orderbook> {
+    const { sinaSymbol } = parseCnSymbol(symbol)
+    const res = await this.fetchT(`${this.tencentBaseURL}/q=${sinaSymbol}`)
+    if (!res.ok) throw new Error(`Tencent quote HTTP ${res.status} for ${symbol}`)
+    const text = await res.text()
+    const { orderbook } = parseTencentQuote(text, symbol)
+    return orderbook
+  }
+
+  async getFundamentals(symbol: string): Promise<FundamentalsPackage> {
+    const { sinaSymbol } = parseCnSymbol(symbol)
+    const res = await this.fetchT(`${this.tencentBaseURL}/q=${sinaSymbol}`)
+    if (!res.ok) throw new Error(`Tencent quote HTTP ${res.status} for ${symbol}`)
+    const text = await res.text()
+    const { fundamentals } = parseTencentQuote(text, symbol)
+    return fundamentals
+  }
+}
+
+
+/** Parse Sina MoneyFlow.ssl_qsfx_zjlrqs (newest row first). netamount = 主力净流入, r0_net = 超大单, ratioamount = net / 成交额. */
+export function parseSinaMoneyFlow(raw: string, symbol: string): MoneyFlow {
+  let rows: unknown
+  try { rows = JSON.parse(raw) } catch { throw new Error(`invalid Sina moneyflow JSON: ${raw.slice(0, 80)}`) }
+  const row = Array.isArray(rows) ? rows[0] as Record<string, string> | undefined : undefined
+  const net = row ? Number(row['netamount']) : NaN
+  if (!row || !Number.isFinite(net) || !row['opendate']) throw new Error(`no Sina money flow rows for ${symbol}`)
+  const superLarge = Number(row['r0_net'])
+  const ratio = Number(row['ratioamount'])
+  const mainRatioPct = Number.isFinite(ratio) ? Number((ratio * 100).toFixed(2)) : null
+  const ratioStr = mainRatioPct !== null ? ` (${mainRatioPct >= 0 ? '+' : ''}${mainRatioPct}%)` : ''
+  return {
+    symbol,
+    time: cnTimeToIso(row['opendate']),
+    netInflow: net,
+    superLargeInflow: Number.isFinite(superLarge) ? superLarge : null,
+    largeInflow: null,
+    mediumInflow: null,
+    smallInflow: null,
+    mainRatioPct,
+    summary: `主力净流入 ${formatRmbAmount(net)}${ratioStr}${Number.isFinite(superLarge) ? ` | 超大单 ${formatRmbAmount(superLarge)}` : ''} [新浪兜底]`,
+  }
+}
+
+/** Upstream quote endpoints occasionally hang; never let a tool call wait forever. */
+// Tunable per docs/user/develop/basic/config.md ("Do not hardcode tunable values"): Config.timeoutMs.
+const DEFAULT_FETCH_TIMEOUT_MS = 8_000
+
+/** Drop rows whose OHLC did not parse — a NaN bar poisons every indicator downstream. */
+export function finiteBars(bars: Candle[]): Candle[] {
+  return bars.filter(b => [b.open, b.high, b.low, b.close].every(Number.isFinite) && !Number.isNaN(Date.parse(b.time)))
+}
+
+export function apply(ctx: Context, config: Config): void {
+  ctx.effect(() => ctx.marketData.register(new CnMarketProvider(config.id, config.eastmoneyBaseURL, config.sinaBaseURL, config.tencentBaseURL, config.timeoutMs, config.sinaMoneyFlowBaseURL)))
+}

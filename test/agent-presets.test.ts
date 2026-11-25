@@ -5,7 +5,14 @@ import { join } from 'node:path'
 const root = join(__dirname, '..')
 
 describe('bundle ships trading + analyst agent presets', () => {
-  const patch = readFileSync(join(root, 'bundle/trading/cordis.patch.yml'), 'utf8')
+  const patch = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')
+
+  it('declares only one dsh-trading plugin row and zero @dsh-trading/* rows', () => {
+    expect(patch).not.toMatch(/@dsh-trading\//)
+    expect(patch).toMatch(/id:\s*dsh-trading/)
+    expect(patch).toMatch(/name:\s*'dsh-trading'/)
+    expect(patch).toMatch(/id:\s*ui-layout/)
+  })
 
   it('declares preset-trading and preset-analyst with official ids', () => {
     expect(patch).toMatch(/id:\s*preset-trading/)
@@ -36,7 +43,8 @@ describe('bundle ships trading + analyst agent presets', () => {
     expect(tradingIdx).toBeGreaterThan(-1)
     expect(analystIdx).toBeGreaterThan(-1)
     const presetRegion = patch.slice(Math.min(tradingIdx, analystIdx))
-    expect(presetRegion).not.toMatch(/@dsh-trading\/tool-market/)
+    expect(presetRegion).not.toMatch(/@dsh-trading\//)
+    expect(presetRegion).not.toMatch(/name:\s*['"]?dsh-trading['"]?/)
   })
 })
 
@@ -97,7 +105,7 @@ function presetYmlDescription(id: 'trading' | 'analyst'): string {
 }
 
 describe('presets tell the analysis through resolve_symbol + walkthrough', () => {
-  const patch = readFileSync(join(root, 'bundle/trading/cordis.patch.yml'), 'utf8')
+  const patch = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')
 
   for (const id of ['trading', 'analyst'] as const) {
     it(`${id}: the bundle patch and the presets/ mirror carry the same persona`, () => {

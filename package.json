@@ -1,30 +1,114 @@
 {
   "name": "dsh-trading",
-  "private": true,
+  "version": "0.3.0",
   "type": "module",
-  "description": "Trading research workbench for DeepSeek Harness — market-data seam, BYO data providers, and model-facing analysis tools",
+  "description": "Unified trading research & technical analysis workbench for DeepSeek Harness — market data hub, providers, analysis tools, backtest audit, portfolio/watchlist/knowledge/schedule, risk guard, interactive chart cards, and chart-first shell",
   "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "presets"
+  ],
   "engines": {
+    "dsh": ">=0.2.2-rc.5 <0.3.0-0",
     "node": ">=20"
   },
   "scripts": {
-    "build": "pnpm run check:deps && pnpm -r run build",
-    "typecheck": "pnpm run check:deps && pnpm -r run typecheck",
+    "prepare": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs",
+    "typecheck": "node scripts/typecheck.mjs",
     "test": "vitest run",
     "check:deps": "node scripts/dependency-identity.mjs",
     "check:boundary": "node scripts/boundary-check.mjs",
     "check:tools": "node scripts/tools-audit.mjs",
     "check:home": "node scripts/home-guard.mjs",
     "audit:all": "pnpm run check:deps && pnpm run check:boundary && pnpm run check:tools && pnpm run check:home",
-    "clean": "pnpm -r exec rm -rf lib"
+    "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('lib', { recursive: true, force: true }))\""
   },
-  "devDependencies": {
-    "vitest": "^3.0.0"
-  },
-  "packageManager": "pnpm@10.4.1",
   "dsh": {
     "bundle": {
-      "patch": "./bundle/trading/cordis.patch.yml"
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-shortcuts",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-theme",
+        "@deepseek-ai/dsh-client-ui-tool",
+        "@deepseek-ai/dsh-client-connection"
+      ]
     }
-  }
+  },
+  "dependencies": {
+    "klinecharts": "10.1.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.4 <5.0.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/schemastery": ">=3.18.1 <4.0.0",
+    "futu-api": "*",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "futu-api": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.2.0-alpha.1",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-locale": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-shortcuts": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-store": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-ui-layout": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-ui-theme": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-client-ui-tool": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.2.3-alpha.2",
+    "@deepseek-ai/schemastery": "~3.20.0-alpha.1",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.0",
+    "esbuild": "^0.24.0",
+    "futu-api": "10.9.6908",
+    "react": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kim1232aa/dsh-trading-v2.git"
+  },
+  "homepage": "https://github.com/kim1232aa/dsh-trading-v2#readme",
+  "bugs": "https://github.com/kim1232aa/dsh-trading-v2/issues",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "trading",
+    "market-data",
+    "technical-analysis",
+    "research"
+  ],
+  "packageManager": "pnpm@10.4.1"
 }
