@@ -2,7 +2,7 @@
  * Assemble check results into the one thing this package exists to produce:
  * a verdict that is allowed to say NOT PROVEN — and that names, out loud,
  * what it cannot see.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 import type { BacktestArtifact } from './artifact.js'

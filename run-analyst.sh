@@ -42,4 +42,4 @@ fi
 
 cd "$(dirname "$0")"
 export "$VAR=$key"
-exec npx -y @deepseek-ai/dsh@0.1.0-rc.6 --profile trading "$@"
+exec dsh --profile trading "$@"

@@ -1073,7 +1073,7 @@ function ChartPanelInner({ width, market, ask, feed }: ChartOwnerProps & ChartPa
     return () => { active = false }
   }, [market])
 
-  // Dynamically load user watchlist from @dsh-trading/watchlist
+  // Dynamically load user watchlist from src/watchlist
   useEffect(() => {
     let active = true
     if (typeof market.getWatchlist === 'function') {

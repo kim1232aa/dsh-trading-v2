@@ -1,6 +1,6 @@
 /**
  * Watchlist types and state contracts.
- * @module @dsh-trading/watchlist
+ * @module dsh-trading/watchlist
  */
 
 export interface WatchlistItem {

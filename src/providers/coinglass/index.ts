@@ -2,7 +2,7 @@
  * CoinGlass capi large-order provider. Not an OHLCV MarketDataProvider —
  * exposes `ctx.coinglass` for tool-market / client-chart.
  * Private frontend API; may break without notice.
- * @module @dsh-trading/provider-coinglass
+ * @module dsh-trading/providers/coinglass
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'

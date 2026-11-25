@@ -10,7 +10,7 @@
  *   momentum; contracting indicates momentum decay.
  *
  * Pure; browser chart and market_snapshot share the same code.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import { rsi } from './indicators.js'

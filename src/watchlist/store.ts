@@ -1,6 +1,6 @@
 /**
  * Atomic persistent file store for watchlist.
- * @module @dsh-trading/watchlist
+ * @module dsh-trading/watchlist
  */
 
 import { randomUUID } from 'node:crypto'

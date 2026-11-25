@@ -2,7 +2,7 @@
  * Two-zone portfolio holdings and trade ledger plugin.
  * Provides staging safety zone, weighted average cost basis accounting,
  * and tools for tracking positions and trades.
- * @module @dsh-trading/holdings
+ * @module dsh-trading/holdings
  */
 
 import type { Context } from '@deepseek-ai/cordis'

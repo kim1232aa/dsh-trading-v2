@@ -2,7 +2,7 @@
  * The backtest-artifact contract: the normalized shape `verdict` audits,
  * regardless of which engine produced it. Dependency-free on purpose, like
  * the market-data seam — an engine implements this and nothing else.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 import type { Timeframe } from '../market-data/index.js'

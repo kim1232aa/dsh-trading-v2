@@ -1,6 +1,6 @@
 /**
  * Persistent task scheduler and execution logger.
- * @module @dsh-trading/tasks-schedule
+ * @module dsh-trading/tasks-schedule
  */
 
 import { randomUUID } from 'node:crypto'

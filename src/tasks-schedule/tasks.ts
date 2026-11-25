@@ -1,6 +1,6 @@
 /**
  * Built-in research and market surveillance action runners.
- * @module @dsh-trading/tasks-schedule
+ * @module dsh-trading/tasks-schedule
  */
 
 import type { MarketData } from '../market-data/index.js'

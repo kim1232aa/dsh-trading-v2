@@ -6,7 +6,7 @@
  *
  * Pure and deterministic like the indicator math — the same candles always
  * produce byte-identical SVG, so a replayed session shows the same chart.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import type { Candle } from '../market-data/index.js'

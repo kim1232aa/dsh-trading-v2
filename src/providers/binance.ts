@@ -3,7 +3,7 @@
  * built-in fetch. Serves any USDT-quoted spot pair Binance lists.
  *
  * ponytail: one exchange, no WebSocket, no rate-limit retry. Add when needed.
- * @module @dsh-trading/provider-binance
+ * @module dsh-trading/providers/binance
  */
 
 import type { Context } from '@deepseek-ai/cordis'

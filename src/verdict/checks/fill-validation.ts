@@ -2,7 +2,7 @@
  * Validate reported fills against the real candle window — the same
  * philosophy as annotate_chart's trust gate, applied to trades: a price the
  * bar never printed is a fill that never happened.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 import type { Candle } from '../../market-data/index.js'

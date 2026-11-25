@@ -4,7 +4,7 @@
  * mutated, positions without enough history are null, textbook definitions
  * (Wilder smoothing where Wilder defined it) so values reconcile against any
  * charting platform a user compares with.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import type { Candle } from '../market-data/index.js'

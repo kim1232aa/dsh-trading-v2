@@ -2,7 +2,7 @@
  * Effective sample size: duplicated or overlapping same-side trades are not
  * independent observations. One lucky trade copied 800 times must not buy
  * its way past the power check or narrow the baseline distribution.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 import type { ArtifactTrade } from '../artifact.js'

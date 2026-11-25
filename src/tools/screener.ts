@@ -2,7 +2,7 @@
  * Pure-function market screener engine.
  * Scans a basket of symbols across multiple timeframe regimes to identify
  * technical setups — both bullish and bearish patterns.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import type { Candle, MarketDataProvider, Timeframe } from '../market-data/index.js'

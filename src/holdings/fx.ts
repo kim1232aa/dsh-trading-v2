@@ -8,7 +8,7 @@
  * - Fiat (CNY) converts via a public USD book, then into the base.
  * - Sources (no API key): 1) jsdelivr currency-api  2) open.er-api.com
  * - Research-only mark: not a broker settlement rate; stamp `asOf` + `source`.
- * @module @dsh-trading/holdings
+ * @module dsh-trading/holdings
  */
 
 import type { Currency } from './types.js'

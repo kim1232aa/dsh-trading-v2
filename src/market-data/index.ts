@@ -3,7 +3,7 @@
  * The service owns no IO — providers own their media (files, databases,
  * exchange APIs); this hub only routes queries and scopes registrations to
  * the registering plugin's lifetime.
- * @module @dsh-trading/market-data
+ * @module dsh-trading/market-data
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'

@@ -8,7 +8,7 @@
  * with the header `time,open,high,low,close,volume` and ISO-8601 UTC times,
  * ascending. Small by design — this package is the template a user copies to
  * put their OWN store (ClickHouse, broker API, CCXT) behind the same seam.
- * @module @dsh-trading/provider-csv
+ * @module dsh-trading/providers/csv
  */
 
 import { readdir, readFile } from 'node:fs/promises'

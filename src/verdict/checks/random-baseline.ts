@@ -6,7 +6,7 @@
  * bars), never by its self-reported prices, so an optimistic intrabar fill
  * assumption cannot buy a percentile. Self-reported vs shadow is reported
  * separately as the fill-model gap.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 import type { Candle } from '../../market-data/index.js'

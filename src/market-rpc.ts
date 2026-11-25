@@ -134,7 +134,7 @@ export interface FundamentalsResponse {
   fundamentals: FundamentalsPackage | null
 }
 
-/** The `watchlist` answer: items and user categories stored in @dsh-trading/watchlist. */
+/** The `watchlist` answer: items and user categories stored in src/watchlist. */
 export interface WatchlistResponse {
   items: { symbol: string; group: string; notes?: string }[]
   groups: string[]

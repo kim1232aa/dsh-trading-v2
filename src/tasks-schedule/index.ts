@@ -1,6 +1,6 @@
 /**
- * `@dsh-trading/tasks-schedule`: Automated active research and market monitoring scheduled tasks.
- * @module @dsh-trading/tasks-schedule
+ * `dsh-trading/tasks-schedule`: Automated active research and market monitoring scheduled tasks.
+ * @module dsh-trading/tasks-schedule
  */
 
 import { resolve } from 'node:path'

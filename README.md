@@ -64,12 +64,12 @@ shot.
 
 ▶ **[80-second demo with narration on YouTube](https://www.youtube.com/watch?v=9KLpy-jPtKY)**
 
-Recorded before the chart-first shell existed, and still exactly how the `web`
-surface behaves *without* `@dsh-trading/client-frame`: the agent answers with
-an interactive chart card, chips draw indicator panes from the exact per-bar
-series the model read, and `annotate_chart` puts levels on the chart through a
-trust gate — mandatory provenance, prices validated against the real candle
-window.
+Recorded before the chart-first shell existed, and still how the `web`
+surface behaves when `tradingFrame: false` is set in `dsh-trading` config:
+the agent answers with an interactive chart card, chips draw indicator panes
+from the exact per-bar series the model read, and `annotate_chart` puts
+levels on the chart through a trust gate — mandatory provenance, prices
+validated against the real candle window.
 
 [![Interactive chart cards in dsh web: chips toggle indicator panes drawn from the model's own numbers; annotate_chart draws provenance-gated levels](media/demo-preview.gif)](https://www.youtube.com/watch?v=9KLpy-jPtKY)
 
@@ -77,67 +77,63 @@ window.
 
 ## Design
 
-Fifteen packages, one direction of dependency:
+One unified DSH plugin package (`dsh-trading`) with clean internal module boundaries enforced by `pnpm run check:boundary`:
 
 ```
-@dsh-trading/tool-market      model-facing tools (list_symbols, get_ohlcv,
-                              market_snapshot, annotate_chart, render_chart)
-                              + the indicator library
+src/tools/          model-facing tools (list_symbols, get_ohlcv,
+                    market_snapshot, annotate_chart, walkthrough,
+                    find_swing_points, find_supply_demand_zones,
+                    large_orders, screen_market, run_backtest,
+                    run_custom_indicator, render_chart) + indicator library
         │  consumes
         ▼
-@dsh-trading/market-data      the seam: ctx.marketData — typed candle/symbol interface
+src/market-data/    the seam: ctx.marketData — typed candle/symbol interface
         ▲  implements
         │
-@dsh-trading/provider-csv     reference provider: local CSV files
-@dsh-trading/provider-futu    live provider: HK / US / A-share equities and
-                              24/7 crypto pairs, from a local Futu OpenD
+src/providers/
+  ├── csv.ts        local CSV files (<dataDir>/<symbol>/<timeframe>.csv)
+  ├── cn.ts         A-share bars, money flow, quotes (Eastmoney/Sina/Tencent)
+  ├── binance.ts    crypto bars & derivatives (Binance + OKX public APIs)
+  ├── coinglass/    large-order walls (ctx.coinglass)
+  └── futu/         opt-in broker gateway (HK / US / A-share / crypto via OpenD)
 
-@dsh-trading/risk-guard       independent: refuses execution-shaped tool names
-                              from any plugin, at dsh's tools/pre-execute gate
+src/risk-guard/     independent: refuses execution-shaped tool names
+                    from any plugin, at dsh's tools/pre-execute gate
 
-@dsh-trading/verdict          the evaluation harness: audit_backtest validates
-                              fills against real candles, runs a seeded
-                              random baseline and sample-size power check;
-                              lint_strategy_code hunts lookahead leaks.
-                              Verdicts may honestly be NOT PROVEN.
+src/verdict/        the evaluation harness: audit_backtest validates
+                    fills against real candles, runs a seeded
+                    random baseline and sample-size power check;
+                    lint_strategy_code hunts lookahead leaks.
+                    Verdicts may honestly be NOT PROVEN.
 
-@dsh-trading/client-chart     web-only cards + the persistent chart column and
-                              the loopback channel that feeds it; host-side,
-                              the get_chart_view tool and the per-turn
-                              context line that let the agent read that column
-        │  fills the chart seat of
-        ▼
-@dsh-trading/client-frame     web-only: the shell frame. Replaces dsh's stock
-                              three-column layout row with a chart-first one —
-                              sidebar | chart | main | rightbar (stock 0.2
-                              seat names; conversation mounts into `main`),
-                              70/30 by default with the sidebar railed — and
-                              declares the `trading.chart` seat
+src/client/         web-only cards + the persistent chart column and
+                    the loopback channel that feeds it; paired with
+                    src/chart-view.ts (get_chart_view tool and per-turn
+                    context line) + chart-first TradingFrame shell
+                    (replaces stock ui-layout when tradingFrame !== false:
+                    sidebar | chart | main | rightbar, 70/30 default split,
+                    declaring the trading.chart seat)
 
-Research-desk plugins (bundled, each registers its own tools on ctx.tools):
-@dsh-trading/holdings         ledger: stage_trade / commit_trade / discard_trade,
-                              get_holdings, list_trades (records, never executes)
-@dsh-trading/watchlist        add_to_watchlist / remove_from_watchlist / get_watchlist
-@dsh-trading/knowledge        thesis store: record_thesis, query_theses,
-                              update_thesis_status
-@dsh-trading/authority        check_trade_authority: fail-closed Ed25519 grant check
-@dsh-trading/tasks-schedule   scheduled research tasks (create/list/remove/
-                              run_scheduled_task_now, get_scheduled_task_logs);
-                              reads ctx.marketData only when present
-
-More providers (opt-in, NOT bundled — they call live public endpoints):
-@dsh-trading/provider-cn      A-share bars, money flow, orderbook
-                              (Eastmoney, Sina fallback, Tencent quotes)
-@dsh-trading/provider-binance crypto bars and derivatives from Binance public APIs
+Research-desk modules (registered on ctx.tools from src/index.ts):
+src/holdings/       ledger: stage_trade / commit_trade / discard_trade,
+                    get_holdings, list_trades (records, never executes)
+src/watchlist/      add_to_watchlist / remove_from_watchlist / get_watchlist
+                    (shared WatchlistStore with /dsh-trading-market RPC)
+src/knowledge/      thesis store: record_thesis, query_theses,
+                    update_thesis_status
+src/authority/      check_trade_authority: fail-closed Ed25519 grant check
+src/tasks-schedule/ scheduled research tasks (create/list/remove/
+                    run_scheduled_task_now, get_scheduled_task_logs);
+                    reads ctx.marketData only when present
 ```
 
-- **`market-data`** defines the seam and nothing else (its only peer is cordis). Every consumer talks to `ctx.marketData`; every data source hides behind `MarketDataProvider`.
-- **`provider-csv`** is the *bring-your-own-data* template: ~100 lines, local `<root>/<symbol>/<timeframe>.csv` files. Copy it to put ClickHouse, a broker API, or CCXT behind the same interface — tools upstream never change.
-- **`provider-futu`** is that template filled in against a real broker gateway: HK / US / A-share equities and crypto pairs (`CC.BTCUSDT`), the last being the only instrument that keeps moving at 3am, which makes it the honest way to check that "live" is live. It reads `Qot_GetKL` rather than `Qot_RequestHistoryKL` on purpose: GetKL rides the subscription quota and serves the most recent bars (≤1000), while RequestHistoryKL spends a scarce historical quota OpenD rations by account assets. The trade is stated in the provider's own `description` and honoured in its behaviour — `start` / `end` **filter** the fetched window, they do not seek, so a query for an older range returns honestly empty rather than quietly wrong. See [Live data](#live-data-futu-opend) for setup; note that OpenD is an account-bound personal gateway, which is a licensing fact, not a configuration one.
+- **`src/market-data/`** defines the seam (`ctx.marketData`) behind which every `MarketDataProvider` sits.
+- **`src/providers/csv.ts`** is the *bring-your-own-data* template: local `<root>/<symbol>/<timeframe>.csv` files. Copy or add a provider behind `MarketDataProvider` — tools upstream never change.
+- **`src/providers/futu/`** is an opt-in broker gateway provider: HK / US / A-share equities and crypto pairs (`CC.BTCUSDT`), the last being the only instrument that keeps moving at 3am, which makes it the honest way to check that "live" is live. It reads `Qot_GetKL` rather than `Qot_RequestHistoryKL` on purpose: GetKL rides the subscription quota and serves the most recent bars (≤1000), while RequestHistoryKL spends a scarce historical quota OpenD rations by account assets. The trade is stated in the provider's own `description` and honoured in its behaviour — `start` / `end` **filter** the fetched window, they do not seek, so a query for an older range returns honestly empty rather than quietly wrong. See [Live data](#live-data-futu-opend) for setup; note that OpenD is an account-bound personal gateway, which is a licensing fact, not a configuration one.
 
-  `futu-api` is a **peer** dependency, deliberately unpinned. The SDK's version is coupled to the OpenD *you* have installed, not to this package, and Futu states outright that its package versions follow its own scheme rather than semver — so no range expresses "compatible" and the two must be aligned by hand. Install the `futu-api` matching your OpenD (`10.9.x` SDK for a `10.9.x` OpenD). The provider checks this itself at connect, via `GetGlobalState`, and logs a warning naming both versions if the protocol lines differ — a skew otherwise surfaces as a rejected handshake or an empty decode, with nothing to point at.
-- **`tool-market`** registers read-only analysis tools on `ctx.tools`. `market_snapshot` returns a whole multi-timeframe indicator regime in one call (RSI, slow stochastic, ADX/DI, MACD, MFI, ATR, SMA/EMA posture, Bollinger) with coarse state labels; `get_ohlcv` serves raw bars when structure matters. The indicator math is pure and deterministic — textbook definitions with Wilder smoothing where Wilder defined it — so values reconcile against any charting platform and a session-log replay recomputes identical model-visible numbers.
-- **`client-chart`** draws the charts, and drives them from two independent ends. The model's `market_snapshot` / `annotate_chart` results render as cards through the `tool.call.toolview` seam. The USER drives the persistent column directly: a symbol box and timeframe row talk to `ctx.marketData` over a loopback RPC channel the package's host half publishes. That second path is the point — a workbench whose only input is "hope the agent calls the right tool" stops working the moment the agent would rather chat, which is exactly what happens in practice. The channel exposes the two read verbs of `MarketDataProvider` plus one write that only records what the panel is showing; it never touches the tool layer, so risk-guard's execution gate is neither weakened nor bypassed.
+  `futu-api` is an optional **peer** dependency, deliberately unpinned. The SDK's version is coupled to the OpenD *you* have installed, not to this package, and Futu states outright that its package versions follow its own scheme rather than semver — so no range expresses "compatible" and the two must be aligned by hand. Install the `futu-api` matching your OpenD (`10.9.x` SDK for a `10.9.x` OpenD). The provider checks this itself at connect, via `GetGlobalState`, and logs a warning naming both versions if the protocol lines differ — a skew otherwise surfaces as a rejected handshake or an empty decode, with nothing to point at.
+- **`src/tools/`** registers read-only analysis tools on `ctx.tools`. `market_snapshot` returns a whole multi-timeframe indicator regime in one call (RSI, slow stochastic, ADX/DI, MACD, MFI, ATR, SMA/EMA posture, Bollinger) with coarse state labels; `get_ohlcv` serves raw bars when structure matters. The indicator math is pure and deterministic — textbook definitions with Wilder smoothing where Wilder defined it — so values reconcile against any charting platform and a session-log replay recomputes identical model-visible numbers.
+- **`src/client/` (chart & cards)** draws the charts, and drives them from two independent ends. The model's `market_snapshot` / `annotate_chart` / `walkthrough` results render as cards through the `tool.call.toolview` seam. The USER drives the persistent column directly: a symbol box and timeframe row talk to `ctx.marketData` over a loopback RPC channel (`/dsh-trading-market`) published by `src/index.ts`. That second path is the point — a workbench whose only input is "hope the agent calls the right tool" stops working the moment the agent would rather chat, which is exactly what happens in practice. The channel exposes the read verbs of `MarketDataProvider`, watchlist read/write, and chart-state reporting; it never touches order execution, so `risk-guard`'s execution gate is neither weakened nor bypassed.
 
   The column **follows the conversation rather than mirroring it**. When the agent charts an instrument the panel loads that symbol and timeframe *for itself* — adopting the agent's payload verbatim would pin a frozen ≤200-bar snapshot on screen, which is precisely the "why isn't it moving?" bug this replaced. It refuses to refetch a series it already holds (one analysis calls `annotate_chart` dozens of times on the same chart), and a **pinned** column stops following entirely: the agent's chart becomes a `Show` offer on a pill, not a takeover mid-read. The decision is a pure function with its own test suite, because a policy buried in a `useEffect` is a policy nobody can pin.
 
@@ -146,30 +142,23 @@ More providers (opt-in, NOT bundled — they call live public endpoints):
   The panel also **publishes what it is showing** back to the host, and the host feeds that to the model two ways: a one-line context injection each turn, and a `get_chart_view` tool for the same facts on demand. This closes a loop that was conspicuously open — the panel's data path bypasses the tool layer by design, so nothing about the user's chart reached the agent on its own, and the agent would ask the user to screenshot a chart it was rendering two columns away. The injection costs nothing while the panel is idle (empty text is no contribution), the published value is validated on arrival (it lands in a model's context, which makes it a prompt-injection surface as much as a correctness one), and it expires after 30s so an abandoned second tab cannot make the model confidently name the wrong symbol.
 
   The chart stays **live**: it re-reads the last few bars once a second and merges them by open time, so a forming bar is replaced in place and a new one is appended — append blindly and a live chart grows a duplicate candle every poll. Updates go through `updateData` on the existing plot rather than a rebuild, so the canvas never flickers. A poll rather than a push, deliberately: the host channel is unary, and a chart seconds old is worth far less engineering than a streaming transport. When the tape stops moving — eight polls that taught it nothing — the panel backs off to once every five seconds and springs back the moment a bar moves, which is cheaper and more honest than shipping a market calendar. A hidden tab backs off the same way rather than stopping: some embedded browsers report `hidden` while the user is plainly watching, and a kill-switch there is indistinguishable from the bug it looks like.
-- **`client-frame`** is the layout half of the same row-swap idea. dsh's shell is one plugin row (`ui-layout`) that occupies the built-in `root` slot and declares the stock 0.2 seats (`sidebar` / `main` / `rightbar` / `shell.overlay`) inside it. Slot core permits exactly **one declarer per seat**, so a frame cannot sit beside the stock one — the bundle disables that row and inserts ours, which re-declares those seats *under the same names*. `ui-sidebar` and `ui-conversation` register by name (`conversation` mounts into the keyed `main` seat), so dsh's real sidebar and its real conversation surface mount into a third-party frame unchanged; we only decide the column order. On top of them it adds a fifth seat, `trading.chart`, for the persistent chart column.
+- **`src/client/` (TradingFrame shell)** is the layout half. dsh's shell is one plugin row (`ui-layout`) that occupies the built-in `root` slot and declares the stock 0.2 seats (`sidebar` / `main` / `rightbar` / `shell.bottom` / `shell.leading` / `shell.overlay`) inside it. Slot core permits exactly **one declarer per seat**, so a frame cannot sit beside the stock one — `cordis.patch.yml` disables `ui-layout` whenever `dsh-trading` is enabled and `tradingFrame !== false`, and `dsh-trading/client` re-declares those seats *under the same names* plus `trading.chart`. `ui-sidebar` and `ui-conversation` register by name (`conversation` mounts into the keyed `main` seat), so dsh's real sidebar and its real conversation surface mount into `TradingFrame` unchanged; disabling `dsh-trading` or setting `tradingFrame: false` automatically restores stock `ui-layout`.
 
-  Its defaults differ from the stock shell on purpose. The chart takes **70% of the free width** and the conversation 30 — stored as a *ratio*, not a pixel width, because "the chart takes 70%" has to survive a window resize to mean anything. The conversation floor drops from dsh's 640px to 420, since here it is a side column rather than the whole app; holding 640 would make the split impossible on a laptop. The sidebar starts collapsed to its rail: a permanent session-history column is a poor trade against chart width, so the frame contributes a session switcher to `conversation.session.header.utilities` instead — the route to your sessions lives in the conversation's own top-right, next to the thing it switches. No fork, no patched core — the same mechanism as swapping `market-data-provider`.
-
-  **Opt-in, not bundled.** This row is deliberately absent from `@dsh-trading/bundle`: replacing the whole shell is far too opinionated to impose on everyone who installs the bundle. Add it from your own profile patch when you want it:
-
-  ```yaml
-  - id: ui-layout
-    disabled: true
-
-  - insert:
-      - id: trading-frame
-        name: '@dsh-trading/client-frame'
-  ```
-- **`bundle/trading`** wires eleven rows into a dsh profile via `cordis.patch.yml`: `market-data`, `market-data-provider`, `tool-market`, `verdict`, `risk-guard`, `client-chart`, `holdings`, `watchlist`, `knowledge`, `authority`, `tasks-schedule`. Users repoint or replace the `market-data-provider` row from their own profile patch — that row swap **is** the BYO mechanism. The shell frame and the live providers (`provider-futu`, `provider-cn`, `provider-binance`) are deliberately *not* among those rows. `ctx.marketData` holds several providers at once, so the CN and Binance providers are **added beside** the CSV row rather than swapped in — add them from your own profile patch:
+  Its defaults differ from the stock shell on purpose. The chart takes **70% of the free width** and the conversation 30 — stored as a *ratio*, not a pixel width, because "the chart takes 70%" has to survive a window resize to mean anything. The conversation floor drops from dsh's 640px to 420, since here it is a side column rather than the whole app; holding 640 would make the split impossible on a laptop. The sidebar starts collapsed to its rail: a permanent session-history column is a poor trade against chart width, so the frame contributes a session switcher to `conversation.session.header.utilities` instead — the route to your sessions lives in the conversation's own top-right, next to the thing it switches.
+- **`cordis.patch.yml`** mounts the single `dsh-trading` entry plus the two official `@deepseek-ai/dsh-agent-preset` entries (`trading` / `analyst`). All providers (CSV, CN, Binance+OKX, CoinGlass) and workbench modules (`verdict`, `riskGuard`, `holdings`, `watchlist`, `knowledge`, `authority`, `tasksSchedule`, `chartPanel`) are active by default and configurable under `dsh-trading` `config` in your profile's `cordis.patch.yml`:
 
   ```yaml
-  - insert:
-      - id: provider-cn
-        name: '@dsh-trading/provider-cn'
-        config:
-          timeoutMs: 8000      # per-request upstream timeout
-      - id: provider-binance
-        name: '@dsh-trading/provider-binance'
+  - id: dsh-trading
+    config:
+      tradingFrame: true     # set false to keep stock ui-layout (cards-only mode)
+      dataDir: ./data
+      chartDir: ./charts
+      providers:
+        cn:
+          timeoutMs: 8000
+        binance:
+          enabled: true
+          registerOkx: true
   ```
 
 ### Timeframes
@@ -202,7 +191,7 @@ test.
 
 This project deliberately has **no order-execution capability and no execution seam**. Tools read data and compute; nothing places, routes, or simulates-then-forwards orders. Contributions adding live trading execution are out of scope. Nothing here is investment advice.
 
-`@dsh-trading/risk-guard` extends that stance over plugins this project does not ship: it refuses order-execution and fund-movement tool names at dsh's `tools/pre-execute` gate, so mounting a broker plugin in a `trading` profile does not quietly gain the ability to trade. Name matching is a heuristic and cannot be complete — the guard is defense in depth, not the guarantee. The guarantee is structural: there is no execution seam to reach.
+`src/risk-guard/` extends that stance over plugins this project does not ship: it refuses order-execution and fund-movement tool names at dsh's `tools/pre-execute` gate, so mounting a broker plugin in a `trading` profile does not quietly gain the ability to trade. Name matching is a heuristic and cannot be complete — the guard is defense in depth, not the guarantee. The guarantee is structural: there is no execution seam to reach.
 
 ## Data format (CSV provider)
 
@@ -216,34 +205,21 @@ data/
 
 ## Try it with dsh
 
-One command — the published bundle pulls its eleven plugin rows from npm
-(`client-frame`, `provider-futu`, `provider-cn` and `provider-binance` are opt-in, see below):
+One command — installs the single unified `dsh-trading` plugin and its `cordis.patch.yml` (host + client + TradingFrame + CN/Binance/CSV/CoinGlass providers + presets):
 
 ```sh
-dsh plugin --profile trading add @dsh-trading/bundle
+dsh plugin --profile trading add dsh-trading
 ```
 
 <details>
-<summary>Or from a checkout (for hacking on the packages)</summary>
-
-Build, then compose the profile from local paths. dsh resolves plugin rows from
-the profile directory, so **every package the bundle's patch names must be
-linked alongside it** — miss one and that row fails to resolve at boot:
+<summary>Or from a local checkout (for developing on the plugin)</summary>
 
 ```sh
 pnpm install && pnpm build
 node examples/generate-sample-data.mjs
 
-dsh plugin --profile trading add ./bundle/trading \
-    ./packages/market-data ./packages/provider-csv ./packages/tool-market \
-    ./packages/verdict ./packages/risk-guard ./packages/client-chart \
-    ./packages/holdings ./packages/watchlist ./packages/knowledge \
-    ./packages/authority ./packages/tasks-schedule
+dsh plugin --profile trading add .
 ```
-
-Add `./packages/client-frame`, `./packages/provider-futu`, `./packages/provider-cn`
-or `./packages/provider-binance` to that list if you intend to enable the
-chart-first shell or that live data source.
 
 </details>
 
@@ -272,23 +248,25 @@ websocket_port = 33333
 websocket_key_md5 = <md5 of your key>
 ```
 
-Then install the matching SDK and repoint the provider row from your profile's
-`cordis.patch.yml`:
+Then install the matching SDK and enable `providers.futu` under `dsh-trading`
+in your profile's `cordis.patch.yml`:
 
 ```sh
 npm i futu-api@10.9   # must match your OpenD's version line
 ```
 
 ```yaml
-- id: market-data-provider
-  name: '@dsh-trading/provider-futu'
+- id: dsh-trading
   config:
-    host: 127.0.0.1
-    port: 33333       # the websocket port — NOT api_port (11111)
-    symbols:
-      - CC.BTCUSDT    # crypto: the one that moves 24/7
-      - HK.00700
-      - US.MU
+    providers:
+      futu:
+        enabled: true
+        host: 127.0.0.1
+        port: 33333       # the websocket port — NOT api_port (11111)
+        symbols:
+          - CC.BTCUSDT    # crypto: the one that moves 24/7
+          - HK.00700
+          - US.MU
 ```
 
 `symbols` is the catalogue `list_symbols` reports; any symbol OpenD knows can
@@ -296,11 +274,11 @@ still be typed straight into the chart column.
 
 ### Agent presets (交易模式 / Market Analyst)
 
-Installing `@dsh-trading/bundle` ships two **Agent 预设** as ordinary
-`@deepseek-ai/dsh-agent-preset` rows in the bundle patch (ids `trading` and
-`analyst`). Pick them in the session's preset menu — no copy into
-`$DSH_HOME/.agent-presets/` (that directory is legacy and dsh no longer reads
-it).
+Installing `dsh-trading` ships two **Agent 预设** as ordinary
+`@deepseek-ai/dsh-agent-preset` rows in [cordis.patch.yml](./cordis.patch.yml)
+(ids `trading` and `analyst`). Pick them in the session's preset menu — no copy
+into `$DSH_HOME/.agent-presets/` (that directory is legacy and dsh no longer
+reads it).
 
 | Preset id | Menu name | What it adds |
 |-----------|-----------|--------------|
@@ -309,12 +287,12 @@ it).
 
 Under the default **standard** (or **minimal**) preset, idle chat keeps the
 coding persona: the trading voice and the chart-panel `systemPrompt.context`
-line do **not** apply. Tools from the bundle stay registered either way —
+line do **not** apply. Tools from `dsh-trading` stay registered either way —
 that is the cost of selecting the trading profile, not a per-topic inject.
 
 Persona prose also lives under `presets/trading/` and `presets/analyst/` as
 human-editable mirrors (`prefix`, not the retired `text` field). The ship path
-is the bundle declaration; edit both when changing the voice.
+is [cordis.patch.yml](./cordis.patch.yml); edit both when changing the voice.
 
 The analyst persona holds the research boundary in prose the way `risk-guard`
 holds it in code: report what the data shows, never recommend a position or an
@@ -332,7 +310,7 @@ Open the printed URL, click **Choose workspace**, add the directory you started
 session.
 
 Under the `web` surface, `market_snapshot` and `get_ohlcv` results render as
-interactive candlestick cards (`@dsh-trading/client-chart`): K-line + volume +
+interactive candlestick cards (`src/client/ChartCard.tsx`): K-line + volume +
 SMA20/50/200, timeframe tabs, and a chip strip that both shows the exact
 indicator values the model read and toggles panes for them (RSI, slow
 stochastic, ADX/DI, MACD, MFI, plus Bollinger as a price overlay). Every pane
@@ -354,25 +332,27 @@ panel.
 pnpm install
 pnpm typecheck
 pnpm build
+pnpm run audit:all
 pnpm test
 ```
 
 `pnpm test` includes `test/loader-boot.e2e.test.ts`: a keyless smoke that boots a
-real `dsh web` under a throwaway `DSH_HOME` and loads the **built** plugins
-through dsh's Loader (run `pnpm build` first; it self-skips without `dsh` on
-PATH or without `lib/`). It is what catches a stray `export default`.
+real `dsh web` under a throwaway `DSH_HOME` and loads the **built** single
+`dsh-trading` plugin through dsh's Loader (run `pnpm build` first; it
+self-skips without `dsh` on PATH or without `lib/`). It is what catches a stray
+`export default` or Cordis inject mismatch.
 
 ## Roadmap
 
-- [x] Profile template + docs for stacking onto `dsh --profile web`
-- [x] Chart cards in `dsh web` (`@dsh-trading/client-chart`): `market_snapshot` / `get_ohlcv` render as interactive candlesticks with chip-toggled indicator panes
+- [x] Single-package `dsh-trading` bundle + `cordis.patch.yml` for DSH `0.2.3-alpha.2`
+- [x] Chart cards in `dsh web` (`src/client/ChartCard.tsx`): `market_snapshot` / `get_ohlcv` render as interactive candlesticks with chip-toggled indicator panes
 - [x] Live panel chips: client `enrichChartTimeframe` computes regime series locally (MACD/Stoch/ADX/MFI/BB) when the payload has no agent series
 - [ ] `ENTRY_SIGNAL`（多空观察信号）is **experimental / 未验证** — SuperTrend observer only; off by default in 指标参数
-- [x] `annotate_chart`: model-authored levels/zones/paths with mandatory provenance and a hard price-range gate, plus base/alternative scenarios — rendered on the card with a levels table
+- [x] `annotate_chart` / `walkthrough`: model-authored levels/zones/paths with mandatory provenance and a hard price-range gate, plus base/alternative scenarios — rendered on the card with a levels table
 - [x] Open contracts for ecosystem builders ([CONTRACTS.md](./CONTRACTS.md)): chart payload, open annotation envelope, pure-renderer registry
-- [x] Chart-first shell (`@dsh-trading/client-frame`) and a persistent live column the user drives, with the agent's drawings landing on it
+- [x] Chart-first shell (`src/client/TradingFrame.tsx`) and a persistent live column the user drives, with the agent's drawings landing on it
 - [ ] Chart panel deepening: user-drawing feedback to the agent, `@Remote` host service for pan-back data
-- [ ] Watch/alert contract (notify-only), `@dsh-trading/contracts` package, conformance fixtures
+- [ ] Watch/alert contract (notify-only), standalone contracts export, conformance fixtures
 - [ ] Research-journal session events (hypotheses, signals — replayable)
 - [ ] Deterministic backtest runner as a `ctx.commands` CLI command (never model-executed)
 - [ ] More providers: Parquet, ClickHouse, CCXT

@@ -3,7 +3,7 @@
  * inherit from the tutorials they were trained on. Pattern rules are
  * heuristics and say so in their findings; they prove a *suspect construct
  * exists*, not that the strategy is leak-free when silent.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 export interface LintFinding {

@@ -9,7 +9,7 @@
  * visible to a chart bar only once the bucket has closed by that bar's close
  * (request.security lookahead_off on history). The unclosed HTF bucket is never used.
  * OI comes from our own provider OI history (base-coin units), not TV tickers.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 export type RpCandle = { t: number; open: number; high: number; low: number; close: number; volume: number }

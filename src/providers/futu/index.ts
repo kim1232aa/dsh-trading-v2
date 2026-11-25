@@ -25,7 +25,7 @@
  * OpenD is a personal, account-bound gateway: fine for your own desk, not a
  * redistribution licence. Serving this data onward to other people is a
  * licensing question, not a configuration one.
- * @module @dsh-trading/provider-futu
+ * @module dsh-trading/providers/futu
  */
 
 import type { Context } from '@deepseek-ai/cordis'

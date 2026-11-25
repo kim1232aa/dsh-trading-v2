@@ -1,7 +1,7 @@
 /**
  * Pure mathematical accounting logic for holdings ledger.
  * Weighted-average cost basis; broker-style mark-to-market fields.
- * @module @dsh-trading/holdings
+ * @module dsh-trading/holdings
  */
 
 import type { FxBook } from './fx.js'

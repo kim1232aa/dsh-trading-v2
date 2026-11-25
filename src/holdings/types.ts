@@ -3,7 +3,7 @@
  * Supports two-zone safety model (staged candidates vs committed positions).
  * Field set aligned with common broker UIs (Futu/Moomoo/IB): quantity,
  * sellable qty, cost, mark, market value, unrealized/realized/today PnL, weight.
- * @module @dsh-trading/holdings
+ * @module dsh-trading/holdings
  */
 
 export type TradeSide = 'buy' | 'sell' | 'long' | 'short'

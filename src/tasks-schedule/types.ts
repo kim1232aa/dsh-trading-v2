@@ -1,6 +1,6 @@
 /**
  * Types and contracts for scheduled active research tasks.
- * @module @dsh-trading/tasks-schedule
+ * @module dsh-trading/tasks-schedule
  */
 
 export type TaskAction =

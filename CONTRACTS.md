@@ -10,16 +10,16 @@ Paste this file into your agent and vibecode against it.
 
 ## 1. Market-data provider seam
 
-`ctx.marketData` (from `@dsh-trading/market-data`): implement
+`ctx.marketData` (registered by `dsh-trading` from `src/market-data/`): implement
 `MarketDataProvider { id, description, listSymbols(), getOhlcv(query) }`,
 mount with `ctx.effect(() => ctx.marketData.register(provider))`, and every
-tool upstream works against your data. `provider-csv` (~110 lines) is the
-reference implementation. Swapping the `market-data-provider` row in a profile
-`cordis.patch.yml` is the deployment mechanism; providers with distinct `id`s
-(e.g. `provider-cn` = `cn`, `provider-binance` = `binance`) may also be
-inserted beside it, since the service holds several at once.
+tool upstream works against your data. `src/providers/csv.ts` (~110 lines) is the
+reference implementation. Multiple providers with distinct `id`s (e.g. `csv`,
+`cn`, `binance`, `okx`, `futu`) coexist on `ctx.marketData` simultaneously,
+and can be toggled or configured under `dsh-trading` `config.providers` in
+your profile `cordis.patch.yml`.
 
-Consumers that can work without market data (e.g. `tasks-schedule`) must not
+Consumers that can work without market data (e.g. `src/tasks-schedule/`) must not
 list `marketData` in `inject`; read it with `ctx.get('marketData')` at the use
 site (dsh `docs/user/develop/framework/service.md`). Plugin modules use the
 namespace form (`name` / `inject` / `Config` / `apply`) and carry **no default
@@ -30,8 +30,7 @@ export** (dsh `docs/postmortem/0001-acp-default-export-drops-inject.md`).
 Carried on the durable `tool/result` event's `meta` via dsh's
 `output.presentationMeta`. Never model-visible; survives session replay.
 Producers: `market_snapshot`, `get_ohlcv`, `annotate_chart`
-(`@dsh-trading/tool-market`). Consumer: the card in
-`@dsh-trading/client-chart` — or yours.
+(`src/tools/`). Consumer: the card in `src/client/` — or yours.
 
 ```jsonc
 {
@@ -72,7 +71,7 @@ extensions above stay additive-only within version 1.
 
 `annotations` is an **open array**: every entry has a string `type`; core
 types are `level`, `zone`, `path` (shapes in
-`packages/tool-market/src/chart-payload.ts`). Conventional optional fields for
+`src/tools/chart-payload.ts`). Conventional optional fields for
 new types: `label`, `role`, `sources`, `points`. Rules:
 
 - **Provenance is mandatory** for core types: `sources` (1–6 human-readable
@@ -105,7 +104,7 @@ gate and let cards draw trigger/invalidation lines without parsing prose.
 ## 5. Client renderer registry (`registryVersion: 1`)
 
 ```ts
-import { registerAnnotationRenderer } from '@dsh-trading/client-chart/client'
+import { registerAnnotationRenderer } from 'dsh-trading/client'
 
 registerAnnotationRenderer('elliott_wave', (annotation, ctx) => [
   { kind: 'polyline', points: [...], label: 'W5', color: ctx.palette.target, dashed: true },
@@ -121,8 +120,8 @@ registerAnnotationRenderer('elliott_wave', (annotation, ctx) => [
   hooks exist because none are needed.
 - Register inside your client plugin's `apply()`; dsh's HMR fiber cascade
   re-runs it after reloads. Duplicate registration: last wins, logged.
-- Mark `@dsh-trading/client-chart` **external** in your bundle and require it
-  as `@dsh-trading/client-chart/client` — the dsh module loader resolves
+- Mark `dsh-trading` **external** in your bundle and require it
+  as `dsh-trading/client` — the dsh module loader resolves
   rostered plugin bundles by package name; bundling a private copy gives you
   a second, empty registry.
 - Rendering is best-effort per installed renderer set: a replayed session on
@@ -131,8 +130,8 @@ registerAnnotationRenderer('elliott_wave', (annotation, ctx) => [
 
 ## 6. Backtest artifact — version 1
 
-The shape `@dsh-trading/verdict`'s `audit_backtest` audits; any engine can
-produce it (the planned `@dsh-trading/backtest` and `reference-packs` will).
+The shape `src/verdict/`'s `audit_backtest` audits; any engine can
+produce it.
 Additive-only within version 1; readers MUST ignore unknown fields.
 
 ```jsonc
@@ -166,7 +165,7 @@ Additive-only within version 1; readers MUST ignore unknown fields.
   guarantees, and expiry are unresolved — deliberately unspecified rather
   than specified badly. Whatever lands will be notify-only: execution is
   structurally out of scope and `risk-guard` enforces that at the tool gate.
-- **`@dsh-trading/contracts` package**: dependency-free types + validators,
-  so server-side tools stop importing a client package for types.
+- **Standalone contracts export**: dependency-free types + validators,
+  so external consumers stop importing the full plugin for types.
 - **Conformance fixtures**: golden payloads + a validate function for
   third-party CI.

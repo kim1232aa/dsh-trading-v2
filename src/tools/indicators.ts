@@ -2,7 +2,7 @@
  * Pure indicator math over close prices. Deliberately dependency-free and
  * deterministic: indicator values reach the model, and "model-visible means
  * logged" only helps if replaying the log recomputes identical numbers.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 /** Simple moving average; positions with fewer than `window` samples are null. */

@@ -1,6 +1,6 @@
 /**
  * Research knowledge graph and investment thesis repository plugin.
- * @module @dsh-trading/knowledge
+ * @module dsh-trading/knowledge
  */
 
 import { resolve } from 'node:path'

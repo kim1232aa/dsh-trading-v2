@@ -4,7 +4,7 @@
  *
  * Designed as pure, deterministic functions without external network or runtime dependencies,
  * enabling rigorous isolated unit testing and fail-closed safety auditing.
- * @module @dsh-trading/risk-guard
+ * @module dsh-trading/risk-guard
  */
 
 export type CnBoardType = 'main' | 'chi_next' | 'star' | 'bse'

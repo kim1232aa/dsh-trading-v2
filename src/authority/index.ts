@@ -1,6 +1,6 @@
 /**
  * Cordis plugin for Fail-Closed trade authority.
- * @module @dsh-trading/authority
+ * @module dsh-trading/authority
  */
 
 import type { Context } from '@deepseek-ai/cordis'

@@ -1,6 +1,6 @@
 /**
  * Watchlist Cordis plugin for dsh-trading.
- * @module @dsh-trading/watchlist
+ * @module dsh-trading/watchlist
  */
 
 import { resolve } from 'node:path'

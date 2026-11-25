@@ -1,8 +1,8 @@
 /**
  * The card's copy of the walkthrough contract, read defensively at the trust
  * boundary like payload.ts: `block.meta` is whatever some tool wrote into the
- * session log, possibly by an older or newer @dsh-trading/tool-market.
- * Producer lives at packages/tool-market/src/walkthrough.ts.
+ * session log, possibly by an older or newer `dsh-trading` tools module.
+ * Producer lives at src/tools/walkthrough.ts.
  * @module
  */
 

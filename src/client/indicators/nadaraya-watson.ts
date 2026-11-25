@@ -1,5 +1,5 @@
 /**
- * Nadaraya-Watson Trend [QuantAlgo] — 1:1 port of packages/client-chart/pine/nadaraya-watson.pine.
+ * Nadaraya-Watson Trend [QuantAlgo] — 1:1 port of pine/nadaraya-watson.pine.
  *
  * calcParams map 1:1 to the Pine inputs (L31-49) in source order, followed by
  * one toggle per alertcondition (L159-163), see NW_DEFAULTS. Pine semantics kept:

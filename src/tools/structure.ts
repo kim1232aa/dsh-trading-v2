@@ -6,7 +6,7 @@
  * tail leaves the newest `span + 1` bars unconfirmed; live divergence is reported
  * separately as "未确认".
  * ponytail: fixed span=3, RSI-only divergence; add MACD/OBV variants when asked.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import { rsi } from './indicators.js'

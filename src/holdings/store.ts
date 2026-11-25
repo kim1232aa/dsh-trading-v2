@@ -1,7 +1,7 @@
 /**
  * Persistent store for two-zone portfolio ledger.
  * Staged candidate trades are stored in `staged/`, committed positions in `holdings.json`.
- * @module @dsh-trading/holdings
+ * @module dsh-trading/holdings
  */
 
 import { randomUUID } from 'node:crypto'

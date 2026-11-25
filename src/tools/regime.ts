@@ -8,7 +8,7 @@
  * Every label is derived from the ROUNDED value the snapshot reports, never
  * from the full-precision one behind it, so a label can never contradict the
  * number printed beside it.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import type { Candle, Derivatives } from '../market-data/index.js'

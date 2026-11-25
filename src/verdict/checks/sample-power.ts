@@ -2,7 +2,7 @@
  * Sample-size power math: can this many trades distinguish the claimed edge
  * from a coin flip at all? When the answer is no, the honest verdict is
  * NOT PROVEN — not a prettier Sharpe.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 export interface SamplePowerResult {

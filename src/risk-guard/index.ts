@@ -7,7 +7,7 @@
  * third-party plugin mounted in the same profile — by denying such calls at the
  * `tools/pre-execute` gate. Remove the row to opt out; that removal is the
  * deliberate act the boundary asks for.
- * @module @dsh-trading/risk-guard
+ * @module dsh-trading/risk-guard
  */
 
 import type { Context } from '@deepseek-ai/cordis'

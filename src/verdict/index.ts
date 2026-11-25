@@ -6,7 +6,7 @@
  *
  * Research only, like the rest of dsh-trading: verdicts judge evidence
  * quality; nothing forecasts, recommends, or trades.
- * @module @dsh-trading/verdict
+ * @module dsh-trading/verdict
  */
 
 import { readFile } from 'node:fs/promises'

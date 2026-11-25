@@ -1,6 +1,6 @@
 /**
  * Cryptographic trade authority contracts & types.
- * @module @dsh-trading/authority
+ * @module dsh-trading/authority
  */
 
 export interface TradingGrantPayload {

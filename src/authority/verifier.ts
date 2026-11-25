@@ -1,6 +1,6 @@
 /**
  * Ed25519 cryptographic verifier and Fail-Closed authority engine.
- * @module @dsh-trading/authority
+ * @module dsh-trading/authority
  */
 
 import crypto from 'node:crypto'

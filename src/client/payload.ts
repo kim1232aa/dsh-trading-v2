@@ -1,8 +1,8 @@
 /**
  * The card's copy of the chart-payload contract, validated defensively at the
  * trust boundary: `block.meta` is whatever some tool wrote into the session
- * log, possibly by an older or newer @dsh-trading/tool-market than this card.
- * Producer lives at packages/tool-market/src/chart-payload.ts.
+ * log, possibly by an older or newer `dsh-trading` tools module than this card.
+ * Producer lives at src/tools/chart-payload.ts.
  */
 
 export type ChartCandle = {

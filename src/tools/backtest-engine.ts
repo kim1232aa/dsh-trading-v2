@@ -1,7 +1,7 @@
 /**
  * Pure-function strategy execution and backtesting engine.
- * Generates standard BacktestArtifact directly auditable by `@dsh-trading/verdict`.
- * @module @dsh-trading/tool-market
+ * Generates standard BacktestArtifact directly auditable by `src/verdict`.
+ * @module dsh-trading/tools
  */
 
 import type { Candle } from '../market-data/index.js'

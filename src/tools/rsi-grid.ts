@@ -20,7 +20,7 @@
  * marked at the bar's close.
  *
  * Pure; the browser chart imports this file directly.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import { rsi as rsiSeries } from './indicators.js'

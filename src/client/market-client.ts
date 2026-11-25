@@ -103,7 +103,7 @@ export interface MarketClient {
   ): Promise<PanelLargeOrders | null>
   /** Financial valuation & fundamentals (PE, PB, Market Cap). null when not supported. */
   getFundamentals(symbol: string, providerId?: string, signal?: AbortSignal): Promise<FundamentalsPackage | null>
-  /** User custom watchlist items & groups from @dsh-trading/watchlist. */
+  /** User custom watchlist items & groups from src/watchlist. */
   getWatchlist?(signal?: AbortSignal): Promise<{ items: { symbol: string; group: string; notes?: string }[]; groups: string[] }>
   /** Add a symbol to the custom watchlist. */
   addToWatchlist?(symbol: string, group?: string, notes?: string): Promise<{ ok: boolean; symbol: string }>
@@ -544,7 +544,7 @@ export function derivativesAtBar(live: PanelDerivatives | undefined, bar: PanelD
   }
 }
 
-/** Mirrors `Derivatives` from @dsh-trading/market-data; duplicated to keep host modules out of the browser bundle. */
+/** Mirrors `Derivatives` from src/market-data; duplicated to keep host modules out of the browser bundle. */
 export interface PanelDerivatives {
   source: string
   openInterest: number | null

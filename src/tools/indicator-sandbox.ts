@@ -1,7 +1,7 @@
 /**
  * Sandboxed custom indicator execution engine with strict timeout and isolation.
  * Inspired by @dshtrading/indicators custom sandbox.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import { createContext, runInContext } from 'node:vm'

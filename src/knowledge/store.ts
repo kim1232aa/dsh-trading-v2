@@ -1,6 +1,6 @@
 /**
  * Atomic persistent file store for investment theses and research knowledge nodes.
- * @module @dsh-trading/knowledge
+ * @module dsh-trading/knowledge
  */
 
 import { randomUUID } from 'node:crypto'

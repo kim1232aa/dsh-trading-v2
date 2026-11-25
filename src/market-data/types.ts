@@ -2,7 +2,7 @@
  * The provider-facing vocabulary of the market-data seam. This module is
  * dependency-free on purpose: a provider implements these types and nothing
  * else, so bringing your own data never pulls in harness internals.
- * @module @dsh-trading/market-data
+ * @module dsh-trading/market-data
  */
 
 /**

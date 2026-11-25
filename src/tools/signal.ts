@@ -16,7 +16,7 @@
  * Pure; no imports beyond the indicator modules, so the browser chart can
  * import this file directly and draw exactly what the model reads.
  * ponytail: one fixed rule set; add per-user rule configs when someone asks for them.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import { adx, atr, supertrend } from './candle-indicators.js'

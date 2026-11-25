@@ -2,7 +2,7 @@
  * Pure tool-name policy. Kept free of cordis so the rules can be unit-tested
  * and audited on their own — a safety rule nobody can read in isolation is a
  * safety rule nobody checks.
- * @module @dsh-trading/risk-guard
+ * @module dsh-trading/risk-guard
  */
 
 /** How the guard decides which tool names may run. */

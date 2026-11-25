@@ -3,7 +3,7 @@
  * dsh-trading project) exposes RESEARCH capabilities — nothing here places,
  * routes, or simulates-then-forwards orders, and no order-execution seam
  * exists for a plugin to reach. Analysis stops at the screen.
- * @module @dsh-trading/tool-market
+ * @module dsh-trading/tools
  */
 
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -278,7 +278,7 @@ export function apply(ctx: Context, config: Config): void {
           timeframe: { type: 'string', required: true },
           count: { type: 'integer', required: true },
           csv: { type: 'string', required: true },
-          // Chart tail for the web card (@dsh-trading/client-chart), or null.
+          // Chart tail for the web card (src/client), or null.
           // A json node compiles to an annotation-only schema, so this is not
           // a wire break; render() below never mentions it, so the model's
           // context does not grow by a byte.

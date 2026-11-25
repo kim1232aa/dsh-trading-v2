@@ -1,5 +1,5 @@
 /**
- * Tests for @dsh-trading/provider-csv: the parseCsv contract (fail loud on
+ * Tests for CSV market-data provider: the parseCsv contract (fail loud on
  * shape drift) and the plugin surface — `apply` mounts exactly one provider
  * on the marketData hub, and that provider honours the MarketDataProvider
  * contract over a real on-disk fixture tree.

@@ -1,6 +1,6 @@
 /**
  * Contracts for research hypotheses, thesis tracking, and knowledge nodes.
- * @module @dsh-trading/knowledge
+ * @module dsh-trading/knowledge
  */
 
 export type ThesisDirection = 'bull' | 'bear' | 'neutral'
