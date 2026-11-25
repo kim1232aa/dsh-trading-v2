@@ -124,7 +124,7 @@ describe.skipIf(!launcher || !built)('real dsh Loader boot (keyless, single pack
     const entry = entryFile.replace(/\\/g, '/')
     const r = await boot(`
 - id: ui-layout
-  disabled: !!js "(ctx[Symbol.for('cordis.entry')]?.parent?.data ?? []).some(r => r.id === 'dsh-trading' && !r.disabled && r.config?.tradingFrame !== false)"
+  disabled: !!js "[...ctx.loader.entries()].some(e => e.options.id === 'dsh-trading' && !e.disabled && e.options.config?.tradingFrame !== false)"
 - insert:
     - id: dsh-trading
       name: '${entry}'
@@ -148,7 +148,7 @@ describe.skipIf(!launcher || !built)('real dsh Loader boot (keyless, single pack
     const entry = entryFile.replace(/\\/g, '/')
     const r = await boot(`
 - id: ui-layout
-  disabled: !!js "(ctx[Symbol.for('cordis.entry')]?.parent?.data ?? []).some(r => r.id === 'dsh-trading' && !r.disabled && r.config?.tradingFrame !== false)"
+  disabled: !!js "[...ctx.loader.entries()].some(e => e.options.id === 'dsh-trading' && !e.disabled && e.options.config?.tradingFrame !== false)"
 - insert:
     - id: dsh-trading
       name: '${entry}'

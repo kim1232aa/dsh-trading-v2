@@ -79,7 +79,6 @@ describe('resolveTimeframe', () => {
   })
 
   it('names the available set when asked for something it cannot serve', () => {
-    // @ts-expect-error - deliberately outside the Timeframe union
     expect(() => resolveTimeframe('2h')).toThrow(/available/)
   })
 

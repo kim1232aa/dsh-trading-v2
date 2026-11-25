@@ -3,7 +3,7 @@
 # so disabling or removing `dsh-trading` automatically restores stock `ui-layout`.
 
 - id: ui-layout
-  disabled: !!js "(ctx[Symbol.for('cordis.entry')]?.parent?.data ?? []).some(r => r.id === 'dsh-trading' && !r.disabled && r.config?.tradingFrame !== false)"
+  disabled: !!js "[...ctx.loader.entries()].some(e => e.options.id === 'dsh-trading' && !e.disabled && e.options.config?.tradingFrame !== false)"
 
 - insert:
     - id: dsh-trading

@@ -18,7 +18,7 @@ describe('Indicator Extreme Market Stress Tests', () => {
     const start = Date.now() - count * 60_000
     for (let i = 0; i < count; i++) {
       out.push({
-        openTime: start + i * 60_000,
+        time: new Date(start + i * 60_000).toISOString(),
         open: price,
         high: price,
         low: price,
@@ -37,7 +37,7 @@ describe('Indicator Extreme Market Stress Tests', () => {
     for (let i = 0; i < count; i++) {
       p += (i % 2 === 0 ? 0.0000001 : -0.00000008)
       out.push({
-        openTime: start + i * 60_000,
+        time: new Date(start + i * 60_000).toISOString(),
         open: p,
         high: p * 1.005,
         low: p * 0.995,
@@ -119,7 +119,7 @@ describe('Indicator Extreme Market Stress Tests', () => {
       if (i === 20) p = 1000 // 10x spike
       if (i === 21) p = 1 // 99% crash
       candles.push({
-        openTime: start + i * 60_000,
+        time: new Date(start + i * 60_000).toISOString(),
         open: p,
         high: p * 1.05,
         low: p * 0.95,

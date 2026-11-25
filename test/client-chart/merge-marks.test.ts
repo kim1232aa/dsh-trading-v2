@@ -358,7 +358,7 @@ describe('combineMarks & cross-timeframe path clipping', () => {
     const r = mergeMarks(chart({ timeframes: [{ timeframe: '15m', candles: CANDLES, indicators: null, annotations: [] }] }), marksOf({ timeframe: '4h', annotations: [crossTfPath] }))
     expect(r.applied).toBe(true)
     expect(r.kept).toBe(1)
-    const pts = (r.payload.timeframes[0]?.annotations?.[0] as { points: { time: string; price: number }[] }).points
+    const pts = (r.payload.timeframes[0]?.annotations?.[0] as unknown as { points: { time: string; price: number }[] }).points
     expect(pts[0]?.time).toBe('2026-08-18T00:00:00.000Z')
     expect(pts[0]?.price).toBeCloseTo(130, 5)
     expect(pts[1]).toEqual({ time: '2026-08-20T00:00:00.000Z', price: 170 })
@@ -385,7 +385,7 @@ describe('combineMarks & cross-timeframe path clipping', () => {
     const r1 = mergeMarks(payload, marks)
     expect(r1.applied).toBe(true)
     const digest1 = annotationDigest(r1.payload.timeframes[0]?.annotations, r1.payload.scenarios)
-    const pts1 = (r1.payload.timeframes[0]?.annotations?.[0] as { points: { time: string; price: number; note?: string }[] }).points
+    const pts1 = (r1.payload.timeframes[0]?.annotations?.[0] as unknown as { points: { time: string; price: number; note?: string }[] }).points
 
     // Simulate 3 new 1m candles arriving at the tail
     const nextCandles = [
@@ -396,7 +396,7 @@ describe('combineMarks & cross-timeframe path clipping', () => {
     payload = withCandles(payload, mergeTail(payload.timeframes[0]!.candles, nextCandles))
     const r2 = mergeMarks(payload, marks)
     const digest2 = annotationDigest(r2.payload.timeframes[0]?.annotations, r2.payload.scenarios)
-    const pts2 = (r2.payload.timeframes[0]?.annotations?.[0] as { points: { time: string; price: number; note?: string }[] }).points
+    const pts2 = (r2.payload.timeframes[0]?.annotations?.[0] as unknown as { points: { time: string; price: number; note?: string }[] }).points
 
     expect(digest2).toBe(digest1)
     expect(pts2).toEqual(pts1)

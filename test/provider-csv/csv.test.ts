@@ -224,4 +224,19 @@ describe('CsvProvider.getOhlcv', () => {
       `no data for MSFT @ 1h (expected ${join(root, 'MSFT', '1h.csv')})`,
     )
   })
+
+  it('rejects path traversal and multi-segment symbol paths escaping root', async () => {
+    const parent = await makeRoot()
+    const root = join(parent, 'data')
+    await mkdir(root)
+    await mkdir(join(parent, 'secret'))
+    await writeFile(join(parent, 'secret', '1d.csv'), BODY)
+
+    const provider = mountProvider(root)
+    await expect(provider.getOhlcv({ symbol: '../secret', timeframe: '1d' })).rejects.toThrow(/invalid|escape/i)
+    await expect(provider.getOhlcv({ symbol: '..\\secret', timeframe: '1d' })).rejects.toThrow(/invalid|escape/i)
+    await expect(provider.getOhlcv({ symbol: 'sub/AAPL', timeframe: '1d' })).rejects.toThrow(/invalid|escape/i)
+    await expect(provider.getOhlcv({ symbol: '..', timeframe: '1d' })).rejects.toThrow(/invalid|escape/i)
+    await expect(provider.getOhlcv({ symbol: '.', timeframe: '1d' })).rejects.toThrow(/invalid|escape/i)
+  })
 })

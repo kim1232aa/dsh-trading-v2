@@ -1550,8 +1550,6 @@ function ChartPanelInner({ width, market, ask, feed }: ChartOwnerProps & ChartPa
     }
   }, [live, ownSymbol, ownTf, ownProvider, panelVisible, market, manualProvider])
 
-  if (width === 0) return null
-
   // What the toolbar describes is what is ON SCREEN — which is not always what
   // the user typed. A chart the agent produced arrives with `own` null and the
   // input still empty, and reading the controls off `draft` alone left the
@@ -1593,6 +1591,8 @@ function ChartPanelInner({ width, market, ask, feed }: ChartOwnerProps & ChartPa
       })
     }
   }, [shownSymbol, isCurrentInWatchlist, market, activeGroup])
+
+  if (width === 0) return null
 
   // The reader taking the wheel ends the analyst's walkthrough: its marks are
   // about the chart it was talking over, which is about to change.

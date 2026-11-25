@@ -17,6 +17,7 @@ import { styles } from './styles.js'
 /** The one verb this control needs from `ctx.uiWorkspace`. */
 export interface SessionSwitcherInject {
   open(id: string): void
+  t?: ((key: string) => string) | undefined
 }
 
 /** Rows the switcher lists; a structural subset of the runtime's SessionSummary. */
@@ -67,7 +68,7 @@ export function activeSessionId(snapshot: SessionsSnapshot): string | undefined 
   return snapshot.current
 }
 
-export function SessionSwitcher({ useSessions, open }: SessionSwitcherProps): JSX.Element {
+export function SessionSwitcher({ useSessions, open, t }: SessionSwitcherProps): JSX.Element {
   const [menuOpen, setMenuOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
 
@@ -107,15 +108,15 @@ export function SessionSwitcher({ useSessions, open }: SessionSwitcherProps): JS
         aria-haspopup="menu"
         aria-expanded={menuOpen}
         onClick={() => setMenuOpen(v => !v)}
-        title="Switch session"
+        title={t?.('switchSession') ?? 'Switch session'}
       >
-        Sessions
+        {t?.('sessions') ?? 'Sessions'}
       </button>
       {menuOpen
         ? (
           <div style={MENU} role="menu">
             {rows.length === 0
-              ? <div className={styles.switcherEmpty}>No other sessions yet.</div>
+              ? <div className={styles.switcherEmpty}>{t?.('noOtherSessions') ?? 'No other sessions yet.'}</div>
               : rows.map(row => (
                 <button
                   key={row.id}

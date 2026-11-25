@@ -1039,14 +1039,43 @@ registerIndicator(aicoinTdMarksIndicator as never)
   registerProOverlays()
 }
 
+export function resolveDocumentDark(
+  doc: { documentElement?: { getAttribute?(name: string): string | null }; body?: { hasAttribute?(name: string): boolean } } | undefined,
+  osDark: boolean,
+): boolean {
+  const source = doc?.documentElement?.getAttribute?.('data-ds-theme-source')
+  if (source === 'dark') return true
+  if (source === 'light') return false
+  if (doc?.body?.hasAttribute?.('data-ds-dark-theme')) return true
+  return osDark
+}
+
 export function useDark(): boolean {
-  const [dark, setDark] = useState(() =>
-    typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches)
+  const [dark, setDark] = useState(() => {
+    const osDark = typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches
+    return resolveDocumentDark(typeof document !== 'undefined' ? document : undefined, osDark)
+  })
   useEffect(() => {
-    const media = matchMedia('(prefers-color-scheme: dark)')
-    const onChange = (e: MediaQueryListEvent): void => setDark(e.matches)
-    media.addEventListener('change', onChange)
-    return () => media.removeEventListener('change', onChange)
+    const media = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : undefined
+    const sync = (): void => {
+      setDark(resolveDocumentDark(typeof document !== 'undefined' ? document : undefined, media?.matches ?? false))
+    }
+    sync()
+    const onChange = (e: MediaQueryListEvent): void => {
+      setDark(resolveDocumentDark(typeof document !== 'undefined' ? document : undefined, e.matches))
+    }
+    media?.addEventListener('change', onChange)
+
+    let obs: MutationObserver | undefined
+    if (typeof document !== 'undefined' && typeof MutationObserver === 'function') {
+      obs = new MutationObserver(sync)
+      if (document.body) obs.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
+      obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-ds-theme-source'] })
+    }
+    return () => {
+      media?.removeEventListener('change', onChange)
+      obs?.disconnect()
+    }
   }, [])
   return dark
 }

@@ -4,11 +4,11 @@ import { runCustomIndicator } from '../../src/tools/indicator-sandbox.js'
 
 describe('Custom Indicator Sandbox', () => {
   const candles: Candle[] = [
-    { openTime: 1000, open: 100, high: 105, low: 98, close: 102, volume: 1000 },
-    { openTime: 2000, open: 102, high: 108, low: 101, close: 107, volume: 1500 },
-    { openTime: 3000, open: 107, high: 110, low: 104, close: 105, volume: 1200 },
-    { openTime: 4000, open: 105, high: 106, low: 99, close: 100, volume: 2000 },
-    { openTime: 5000, open: 100, high: 103, low: 97, close: 98, volume: 1800 },
+    { time: new Date(1000).toISOString(), open: 100, high: 105, low: 98, close: 102, volume: 1000 },
+    { time: new Date(2000).toISOString(), open: 102, high: 108, low: 101, close: 107, volume: 1500 },
+    { time: new Date(3000).toISOString(), open: 107, high: 110, low: 104, close: 105, volume: 1200 },
+    { time: new Date(4000).toISOString(), open: 105, high: 106, low: 99, close: 100, volume: 2000 },
+    { time: new Date(5000).toISOString(), open: 100, high: 103, low: 97, close: 98, volume: 1800 },
   ]
 
   it('evaluates simple custom indicator formula', () => {

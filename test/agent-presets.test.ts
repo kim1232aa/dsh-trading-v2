@@ -12,6 +12,7 @@ describe('bundle ships trading + analyst agent presets', () => {
     expect(patch).toMatch(/id:\s*dsh-trading/)
     expect(patch).toMatch(/name:\s*'dsh-trading'/)
     expect(patch).toMatch(/id:\s*ui-layout/)
+    expect(patch).toMatch(/ctx\.loader\.entries\(\)/)
   })
 
   it('declares preset-trading and preset-analyst with official ids', () => {

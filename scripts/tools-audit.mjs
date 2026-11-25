@@ -69,6 +69,8 @@ function auditTools() {
 
   if (toolRegistry.size === 0) {
     errors.push('❌ Zero tools discovered — audit regex or directory mismatch')
+  } else if (toolRegistry.size !== 33) {
+    errors.push(`❌ Expected 33 tools, found ${toolRegistry.size} — update audit or check missing tool definition`)
   }
 
   if (errors.length > 0) {

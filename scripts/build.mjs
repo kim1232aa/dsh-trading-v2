@@ -7,6 +7,7 @@
  *    wrapped in window.__ModuleLoader__.load({ id: 'dsh-trading', factory })
  */
 import { execFileSync } from 'node:child_process'
+import { copyFileSync, mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
@@ -66,3 +67,7 @@ await build({
   },
   footer: { js: 'return module.exports; } });' },
 })
+
+// Keep Apache-2.0 attribution for overlays adapted from @klinecharts/pro inside the published lib/.
+mkdirSync(resolve(root, 'lib/overlays'), { recursive: true })
+copyFileSync(resolve(root, 'src/client/overlays/NOTICE'), resolve(root, 'lib/overlays/NOTICE'))

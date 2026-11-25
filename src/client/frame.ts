@@ -26,6 +26,17 @@ const SHORTCUT_LABELS = {
   pt: { toggle: 'Alternar barra lateral esquerda' },
 }
 
+export const SESSION_SWITCHER_LABELS = {
+  zh: { sessions: '会话', switchSession: '切换会话', noOtherSessions: '暂无其他会话。' },
+  en: { sessions: 'Sessions', switchSession: 'Switch session', noOtherSessions: 'No other sessions yet.' },
+  ja: { sessions: 'セッション', switchSession: 'セッションを切り替え', noOtherSessions: '他のセッションはありません。' },
+  es: { sessions: 'Sesiones', switchSession: 'Cambiar sesión', noOtherSessions: 'Aún no hay otras sesiones.' },
+  fr: { sessions: 'Sessions', switchSession: 'Changer de session', noOtherSessions: 'Aucune autre session pour le moment.' },
+  de: { sessions: 'Sitzungen', switchSession: 'Sitzung wechseln', noOtherSessions: 'Noch keine weiteren Sitzungen.' },
+  ru: { sessions: 'Сессии', switchSession: 'Переключить сессию', noOtherSessions: 'Других сессий пока нет.' },
+  pt: { sessions: 'Sessões', switchSession: 'Trocar sessão', noOtherSessions: 'Ainda não há outras sessões.' },
+}
+
 export function mountTradingFrame(ctx: any): void {
   installFrameStyles()
 
@@ -123,13 +134,21 @@ export function mountTradingFrame(ctx: any): void {
   })
 
   ctx.inject(['uiWorkspace'], (sub: any) => {
+    let switcherT: ((key: string) => string) | undefined
+    if (typeof sub.get === 'function' && sub.get('locale') !== undefined) {
+      sub.effect(() => sub.locale.register('dsh-trading.sessionSwitcher', SESSION_SWITCHER_LABELS), 'dsh-trading: session switcher labels')
+      switcherT = sub.locale.bind('dsh-trading.sessionSwitcher')
+    }
     sub.slots.inject('conversation.session.header.utilities', () => [
       sub.slots.register(
         {
           name: 'conversation.session.header.utilities',
           id: 'trading-session-switcher',
           registrant: 'dsh-trading',
-          inject: () => ({ open: (id: string) => sub.uiWorkspace.openSession(id) }),
+          inject: () => ({
+            open: (id: string) => sub.uiWorkspace.openSession(id),
+            ...(switcherT !== undefined ? { t: switcherT } : {}),
+          }),
         },
         SessionSwitcher,
       ),

@@ -131,7 +131,7 @@ describe('Ecosystem Full-Lifecycle Integration', () => {
         side: 'buy',
         quantity: 100,
         price: 1680,
-        executedAt: new Date().toISOString(),
+        currency: 'CNY',
         notes: 'AI 突破策略信号入场',
       })
       expect(stagedTrade.status).toBe('staged')
@@ -151,7 +151,7 @@ describe('Ecosystem Full-Lifecycle Integration', () => {
         timeframe: '1d',
         title: '茅台估值均线共振突破',
         thesis: 'PE TTM 处于历史 30% 分位，且日线级别均线呈现标准多头排列。',
-        invalidation: '跌破 1650 支撑位且放量则判定逻辑失效。',
+        invalidationCondition: '跌破 1650 支撑位且放量则判定逻辑失效。',
         tags: ['白酒', '核心资产', '多头突破'],
       })
       expect(thesis.id).toBeDefined()
@@ -180,7 +180,7 @@ describe('Ecosystem Full-Lifecycle Integration', () => {
       await taskScheduler.init()
       const task = await taskScheduler.createTask({
         name: '盘后茅台多头动量复盘',
-        action: 'market_scan',
+        action: 'bullish_screen',
         intervalMinutes: 60,
         params: { symbol: '600519', rule: 'bullish_alignment' },
       })

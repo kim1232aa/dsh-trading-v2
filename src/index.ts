@@ -237,6 +237,7 @@ export interface Config {
       futuresURL?: string | undefined
       registerOkx?: boolean | undefined
       okxSymbols?: string[] | undefined
+      allowUnofficialMirrors?: boolean | undefined
     } | undefined
     coinglass?: {
       enabled?: boolean | undefined
@@ -295,13 +296,8 @@ export interface Config {
   } | undefined
 }
 
-const volatileSchema = <S>(schema: S): S => {
-  const s = schema as S & { volatile?: () => S }
-  return typeof s.volatile === 'function' ? s.volatile() : schema
-}
-
 export const Config: z<Config> = z.object({
-  tradingFrame: volatileSchema(z.boolean().default(true)).description('Use the chart-first workbench frame instead of the stock layout.'),
+  tradingFrame: z.boolean().default(true).description('Use the chart-first workbench frame instead of the stock layout (restart plugin after toggling).'),
   defaultProvider: z.string().description('Default market-data provider id when no symbol matcher claims a symbol.'),
   dataDir: z.string().description('Base directory for local trading stores and CSV candles.'),
   chartDir: z.string().description('Directory where render_chart writes HTML files.'),
@@ -328,6 +324,7 @@ export const Config: z<Config> = z.object({
       futuresURL: z.string().default('https://fapi.binance.com'),
       registerOkx: z.boolean().default(true),
       okxSymbols: z.array(z.string()).default([...DEFAULT_BINANCE_SYMBOLS]),
+      allowUnofficialMirrors: z.boolean().default(true).description('Fall back to third-party mirror domains (usnbweb.red, btmrvkxwhpn.com, ouyi.fit) if official Binance/OKX APIs fail.'),
     }).default({}),
     coinglass: z.object({
       enabled: z.boolean().default(true),
@@ -432,15 +429,15 @@ export function apply(ctx: Context, config: Config = {}): void {
   // 1. Core services (`ctx.marketData`, `ctx.coinglass`) registered directly on `ctx`
   new MarketData(ctx, defaultProvider !== undefined ? { defaultProvider } : {})
 
-  if (coinglassEnabled) {
-    applyCoinglass(ctx, {
-      enabled: true,
-      baseURL: p.coinglass?.baseURL ?? 'https://capi.coinglass.com',
-      defaultExchange: p.coinglass?.defaultExchange ?? 'Binance',
-      defaultMarket: p.coinglass?.defaultMarket ?? 'perp',
-      timeoutMs: p.coinglass?.timeoutMs ?? 30_000,
-    })
-  }
+  // Always register `ctx.coinglass` so `enabled: false` refuses requests instead
+  // of falling back to ad-hoc CoinglassCapi clients in tools or RPC.
+  applyCoinglass(ctx, {
+    enabled: coinglassEnabled,
+    baseURL: p.coinglass?.baseURL ?? 'https://capi.coinglass.com',
+    defaultExchange: p.coinglass?.defaultExchange ?? 'Binance',
+    defaultMarket: p.coinglass?.defaultMarket ?? 'perp',
+    timeoutMs: p.coinglass?.timeoutMs ?? 30_000,
+  })
 
   // 2. Market data providers
   if (csvEnabled) {
@@ -467,6 +464,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       futuresURL: p.binance?.futuresURL ?? 'https://fapi.binance.com',
       registerOkx: p.binance?.registerOkx ?? true,
       okxSymbols: p.binance?.okxSymbols ?? [...DEFAULT_BINANCE_SYMBOLS],
+      allowUnofficialMirrors: p.binance?.allowUnofficialMirrors ?? true,
     })
   }
   if (futuEnabled) {
@@ -549,6 +547,9 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   // 6. Browser RPC + chart context + `get_chart_view`
   if (config.chartPanel?.enabled !== false) {
-    applyChartHost(ctx, { watchlistStore })
+    applyChartHost(ctx, {
+      watchlistStore,
+      watchlistEnabled: watchlistCfg.enabled !== false,
+    })
   }
 }

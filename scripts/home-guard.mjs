@@ -25,7 +25,7 @@ function scanDirectory(dir, fileList = []) {
       if (entry.name !== 'node_modules' && entry.name !== 'lib' && entry.name !== 'dist' && entry.name !== '.git') {
         scanDirectory(full, fileList)
       }
-    } else if (entry.isFile() && /\.(ts|tsx|js|mjs|json|yml|yaml)$/.test(entry.name)) {
+    } else if (entry.isFile() && /\.(ts|tsx|js|mjs|json|yml|yaml|md)$/.test(entry.name)) {
       if (!entry.name.endsWith('package-lock.json') && !entry.name.endsWith('pnpm-lock.yaml')) {
         fileList.push(full)
       }
@@ -39,10 +39,12 @@ function auditHomeSafety() {
 
   const filesToScan = [
     ...scanDirectory(join(ROOT_DIR, 'src')),
+    ...scanDirectory(join(ROOT_DIR, 'test')),
     ...scanDirectory(join(ROOT_DIR, 'presets')),
     ...scanDirectory(join(ROOT_DIR, 'scripts')),
     join(ROOT_DIR, 'cordis.patch.yml'),
     join(ROOT_DIR, 'package.json'),
+    join(ROOT_DIR, 'README.md'),
   ].filter(f => existsSync(f))
 
   const violations = []

@@ -173,6 +173,18 @@ export function readOhlcvRequest(payload: unknown): OhlcvRequest | string {
   const symbol = body['symbol']
   if (typeof symbol !== 'string' || symbol.trim() === '') return 'symbol must be a non-empty string'
   if (symbol.length > 64) return 'symbol is implausibly long'
+  const trimmedSymbol = symbol.trim()
+  if (
+    trimmedSymbol === '.'
+    || trimmedSymbol === '..'
+    || /(?:^|[\\/])\.\.(?:$|[\\/])/.test(trimmedSymbol)
+    || trimmedSymbol.includes('\\')
+    || trimmedSymbol.startsWith('/')
+    || /^[A-Za-z]:/.test(trimmedSymbol)
+    || /[\u0000-\u001f\u007f]/.test(trimmedSymbol)
+  ) {
+    return 'symbol contains invalid path characters'
+  }
 
   const timeframe = body['timeframe']
   if (typeof timeframe !== 'string' || !TIMEFRAMES.has(timeframe)) {
@@ -267,7 +279,9 @@ export function readChartView(payload: unknown): ChartView | string {
   const b = payload as Record<string, unknown>
   const symbol = b['symbol']
   const timeframe = b['timeframe']
-  if (typeof symbol !== 'string' || symbol.trim() === '' || symbol.length > 64) return 'view.symbol invalid'
+  if (typeof symbol !== 'string' || symbol.trim() === '' || symbol.length > 64 || /[\u0000-\u001f\u007f]/.test(symbol)) {
+    return 'view.symbol invalid'
+  }
   if (typeof timeframe !== 'string' || !TIMEFRAMES.has(timeframe)) return 'view.timeframe invalid'
   const bars = typeof b['bars'] === 'number' && Number.isFinite(b['bars']) ? Math.max(0, Math.trunc(b['bars'])) : 0
   const iso = (v: unknown): string | undefined =>
@@ -425,11 +439,19 @@ export async function serveMarketEndpoint(
       try {
         const p = marketData.provider(id)
         let timeframes: string[] | undefined
+        let timer: ReturnType<typeof setTimeout> | undefined
         try {
           const seen = new Set<string>()
-          for (const inst of await Promise.race([p.listSymbols(), new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500))])) for (const tf of inst.timeframes ?? []) seen.add(tf)
+          const timeoutPromise = new Promise<never>((_, rej) => {
+            timer = setTimeout(() => rej(new Error('timeout')), 1500)
+          })
+          for (const inst of await Promise.race([p.listSymbols(), timeoutPromise])) {
+            for (const tf of inst.timeframes ?? []) seen.add(tf)
+          }
           if (seen.size > 0) timeframes = [...seen]
-        } catch { /* unknown: client shows the full set */ }
+        } catch { /* unknown: client shows the full set */ } finally {
+          if (timer !== undefined) clearTimeout(timer)
+        }
         return timeframes ? { id: p.id, description: p.description, timeframes } : { id: p.id, description: p.description }
       } catch {
         return { id, description: id }

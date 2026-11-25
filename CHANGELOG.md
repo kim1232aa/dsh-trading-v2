@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 — 2026-11-25
+
+- **Breaking — single-package consolidation (`dsh-trading`)**: merged all 16
+  `@dsh-trading/*` workspace packages (`packages/*` and `bundle/trading`) into a
+  single installable package `dsh-trading` (`src/`, `cordis.patch.yml`,
+  `locale/*.json`, `src/client/index.ts`), enforcing internal L0–L4 layering
+  via `scripts/boundary-check.mjs`.
+- **DSH `0.2.3-alpha.2` & `DSH Tauri` adaptation**:
+  - Updated `engines.dsh` (`>=0.2.2-rc.5 <0.3.0-0`), `engines.node`
+    (`^24.22.3 || >=26.13.1`), `@deepseek-ai/cordis` (`~4.2.0-alpha.1`), and
+    `@deepseek-ai/schemastery` (`~3.20.0-alpha.1`).
+  - Adapted `TradingFrame`, `SessionSwitcher` (`retainedBy.mainView > 0`),
+    `ThemePresenter`, `chart-view` (`ctx.inject(['tools', 'marketData'])`), and
+    Tauri frame detection (`dshtf_frame`).
+  - Shared `WatchlistStore` directly between `get_watchlist` /
+    `add_to_watchlist` / `remove_from_watchlist` and `/dsh-trading-market` RPC.
+- **Security & reliability hardening**:
+  - Blocked path traversal in `CsvProvider.getOhlcv` and `readOhlcvRequest`,
+    and stripped/rejected control characters in `readChartView`.
+  - Fixed `ChartPanelInner` hook ordering when `width === 0`, synced `useDark`
+    with in-app `data-ds-dark-theme` / `data-ds-theme-source`, enforced
+    `providers.coinglass.enabled: false` and `watchlist.enabled: false`, and
+    added `providers.binance.allowUnofficialMirrors`.
+
 ## 0.2.0 — 2026-08-19
 
 - New package `@dsh-trading/verdict` — the evaluation harness, first

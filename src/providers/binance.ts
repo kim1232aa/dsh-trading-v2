@@ -39,6 +39,8 @@ export interface Config {
   registerOkx: boolean
   /** Catalogue for the OKX provider (same tickers, OKX notation under the hood). */
   okxSymbols: string[]
+  /** Fall back to third-party domestic mirror domains (usnbweb.red, btmrvkxwhpn.com, ouyi.fit) if official APIs fail. */
+  allowUnofficialMirrors?: boolean | undefined
 }
 
 export const Config: z<Config> = z.object({
@@ -54,6 +56,7 @@ export const Config: z<Config> = z.object({
   okxSymbols: z.array(z.string()).default([
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT',
   ]),
+  allowUnofficialMirrors: z.boolean().default(true),
 }) as unknown as z<Config>
 
 // Binance spot kline intervals, minus `1s` (sub-minute bars would flood the
@@ -68,14 +71,24 @@ const ALL_TIMEFRAMES: Timeframe[] = [
   '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M',
 ]
 
-/** High-availability mirror hosts for Binance spot public klines. Includes official mirrors and domestic failover endpoints. */
-const SPOT_KLINE_HOSTS = [
+/** Official Binance spot endpoints first; optional third-party failover endpoints last. */
+const SPOT_KLINE_OFFICIAL_HOSTS = [
   'https://data-api.binance.vision',
-  'https://www.usnbweb.red',
   'https://api.binance.com',
   'https://api1.binance.com',
   'https://api3.binance.com',
 ]
+const SPOT_KLINE_MIRROR_HOSTS = ['https://www.usnbweb.red']
+const FUTURES_OFFICIAL_HOSTS = ['https://fapi.binance.com', 'https://www.binance.com']
+const FUTURES_MIRROR_HOSTS = ['https://www.usnbweb.red']
+
+function spotKlineHosts(allowMirrors: boolean): string[] {
+  return allowMirrors ? [...SPOT_KLINE_OFFICIAL_HOSTS, ...SPOT_KLINE_MIRROR_HOSTS] : SPOT_KLINE_OFFICIAL_HOSTS
+}
+
+function futuresHosts(allowMirrors: boolean): string[] {
+  return allowMirrors ? [...FUTURES_OFFICIAL_HOSTS, ...FUTURES_MIRROR_HOSTS] : FUTURES_OFFICIAL_HOSTS
+}
 
 const COMMON_QUOTES = ['USDT', 'USDC', 'BUSD', 'FDUSD', 'BTC', 'ETH']
 
@@ -260,6 +273,7 @@ export class BinanceProvider implements MarketDataProvider {
     private readonly symbols: string[],
     private readonly baseURL: string,
     private readonly futuresURL: string,
+    private readonly allowUnofficialMirrors = true,
   ) {
     this.id = id
     this.description = `Binance public klines (${symbols.length} symbols)`
@@ -283,7 +297,7 @@ export class BinanceProvider implements MarketDataProvider {
 
     const symbol = normalizeSymbol(query.symbol)
     const isCustomBase = this.baseURL && this.baseURL !== 'https://data-api.binance.vision'
-    const hosts = isCustomBase ? [this.baseURL] : SPOT_KLINE_HOSTS
+    const hosts = isCustomBase ? [this.baseURL] : spotKlineHosts(this.allowUnofficialMirrors)
 
     let lastNetworkError: Error | null = null
 
@@ -353,7 +367,7 @@ export class BinanceProvider implements MarketDataProvider {
     }
     if (okxOk) {
       try {
-        return await okxSpotCandles(query.symbol, query.timeframe, query.limit, query.end)
+        return await okxSpotCandles(query.symbol, query.timeframe, query.limit, query.end, this.allowUnofficialMirrors)
       } catch (err) {
         fallbackErr = err as Error
         if (fallbackErr.message.includes('unsupported timeframe')) {
@@ -388,9 +402,11 @@ export class BinanceProvider implements MarketDataProvider {
     const symbol = normalizeSymbol(rawSymbol)
     const n = String(Math.min(1000, Math.max(1, Math.trunc(limit))))
     const perpHosts = !this.futuresURL || this.futuresURL === 'https://fapi.binance.com'
-      ? ['https://www.usnbweb.red', 'https://fapi.binance.com']
+      ? futuresHosts(this.allowUnofficialMirrors)
       : [this.futuresURL]
-    const spotHosts = this.baseURL && this.baseURL !== 'https://data-api.binance.vision' ? [this.baseURL] : SPOT_KLINE_HOSTS
+    const spotHosts = this.baseURL && this.baseURL !== 'https://data-api.binance.vision'
+      ? [this.baseURL]
+      : spotKlineHosts(this.allowUnofficialMirrors)
     const [perp, spot] = await Promise.all([
       takerDeltas(perpHosts, '/fapi/v1/klines', symbol, interval, n),
       takerDeltas(spotHosts, '/api/v3/klines', symbol, interval, n),
@@ -403,7 +419,7 @@ export class BinanceProvider implements MarketDataProvider {
   async getDerivatives(rawSymbol: string): Promise<Derivatives> {
     const symbol = normalizeSymbol(rawSymbol)
     const binance = (): Promise<Derivatives> => this.binanceDerivatives(symbol)
-    const okx = (): Promise<Derivatives> => okxDerivatives(symbol)
+    const okx = (): Promise<Derivatives> => okxDerivatives(symbol, this.allowUnofficialMirrors)
     const gate = (): Promise<Derivatives> => gateDerivatives(symbol)
     const order = Date.now() < this.fallbackUntil ? [okx, gate, binance] : [binance, okx, gate]
     let firstError: unknown
@@ -428,7 +444,7 @@ export class BinanceProvider implements MarketDataProvider {
   private async binanceDerivatives(symbol: string): Promise<Derivatives> {
     const isDefault = !this.futuresURL || this.futuresURL === 'https://fapi.binance.com'
     const candidates = isDefault
-      ? ['https://www.usnbweb.red', 'https://www.binance.com', 'https://fapi.binance.com']
+      ? futuresHosts(this.allowUnofficialMirrors)
       : [this.futuresURL]
     let firstErr: unknown = null
     for (const host of candidates) {
@@ -603,7 +619,7 @@ export class BinanceProvider implements MarketDataProvider {
         let liquidationSummary: string | null = null
         let liquidationSource: string | null = null
         try {
-          const liq = await okxLiquidations1h(symbol)
+          const liq = await okxLiquidations1h(symbol, this.allowUnofficialMirrors)
           liquidationLongUsd1h = liq.longUsd
           liquidationShortUsd1h = liq.shortUsd
           liquidationSummary = liq.summary.replace('近1h爆仓', '近1h爆仓(参OKX)')
@@ -1053,7 +1069,13 @@ export const GATE_TIMEFRAMES: Timeframe[] = Object.keys(GATE_SPOT_TF) as Timefra
 /** Full Binance spot interval set. */
 export const BINANCE_TIMEFRAMES: Timeframe[] = [...ALL_TIMEFRAMES]
 
-async function okxSpotCandles(rawSymbol: string, timeframe: Timeframe, limit = 200, end?: string): Promise<Candle[]> {
+async function okxSpotCandles(
+  rawSymbol: string,
+  timeframe: Timeframe,
+  limit = 200,
+  end?: string,
+  allowMirrors = true,
+): Promise<Candle[]> {
   const symbol = normalizeSymbol(rawSymbol)
   const base = symbol.replace(/(USDT|USDC)$/, '')
   const quote = symbol.endsWith('USDC') ? 'USDC' : 'USDT'
@@ -1063,8 +1085,8 @@ async function okxSpotCandles(rawSymbol: string, timeframe: Timeframe, limit = 2
   // History paging: OKX `after` = bars strictly older than ts; history-candles reaches past the recent window.
   const endMs = end !== undefined ? Date.parse(end) : NaN
   const data = (Number.isFinite(endMs)
-    ? await okxGet('/api/v5/market/history-candles', { instId, bar, limit: String(Math.min(limit, 100)), after: String(endMs + 1) })
-    : await okxGet('/api/v5/market/candles', { instId, bar, limit: String(Math.min(limit, 300)) })) as unknown[][]
+    ? await okxGet('/api/v5/market/history-candles', { instId, bar, limit: String(Math.min(limit, 100)), after: String(endMs + 1) }, allowMirrors)
+    : await okxGet('/api/v5/market/candles', { instId, bar, limit: String(Math.min(limit, 300)) }, allowMirrors)) as unknown[][]
   if (!Array.isArray(data) || data.length === 0) throw new Error(`OKX spot: no bars for ${instId}`)
   return data.slice().reverse().map(r => ({
     time: new Date(Number(r[0])).toISOString(),
@@ -1192,16 +1214,19 @@ async function gateDerivatives(rawSymbol: string): Promise<Derivatives> {
   }
 }
 
-const OKX_DOMAINS = [
-  'https://www.btmrvkxwhpn.com',
-  'https://www.ouyi.fit',
+const OKX_OFFICIAL_DOMAINS = [
   'https://aws.okx.com',
   'https://www.okx.com',
 ]
+const OKX_MIRROR_DOMAINS = [
+  'https://www.btmrvkxwhpn.com',
+  'https://www.ouyi.fit',
+]
 
-async function okxGet(path: string, params?: Record<string, string>): Promise<unknown> {
+async function okxGet(path: string, params?: Record<string, string>, allowMirrors = true): Promise<unknown> {
+  const domains = allowMirrors ? [...OKX_OFFICIAL_DOMAINS, ...OKX_MIRROR_DOMAINS] : OKX_OFFICIAL_DOMAINS
   let firstErr: unknown
-  for (const domain of OKX_DOMAINS) {
+  for (const domain of domains) {
     try {
       const url = new URL(path, domain)
       if (params) {
@@ -1219,15 +1244,15 @@ async function okxGet(path: string, params?: Record<string, string>): Promise<un
 }
 
 /** Page an OKX rubik `[ts, ...]` series (newest first) back to `oldestTs`. Best-effort: null when the first page fails. */
-async function okxPaged(path: string, params: Record<string, string>, oldestTs: number, maxPages = 5): Promise<string[][] | null> {
-  const first = await okxGet(path, { ...params, limit: '100' }).catch(() => null)
+async function okxPaged(path: string, params: Record<string, string>, oldestTs: number, maxPages = 5, allowMirrors = true): Promise<string[][] | null> {
+  const first = await okxGet(path, { ...params, limit: '100' }, allowMirrors).catch(() => null)
   if (!Array.isArray(first)) return null
   const out = first as string[][]
   const seen = new Set(out.map(r => r[0]))
   for (let page = 1; page < maxPages; page++) {
     const last = num(out[out.length - 1]?.[0])
     if (last === null || !Number.isFinite(oldestTs) || last <= oldestTs) break
-    const more = await okxGet(path, { ...params, limit: '100', end: String(last) }).catch(() => null)
+    const more = await okxGet(path, { ...params, limit: '100', end: String(last) }, allowMirrors).catch(() => null)
     if (!Array.isArray(more)) break
     const fresh = (more as string[][]).filter(r => !seen.has(r[0]))
     if (fresh.length === 0) break
@@ -1241,7 +1266,7 @@ async function okxPaged(path: string, params: Record<string, string>, oldestTs: 
  * Recent OKX SWAP liquidations (~1h). Linear USDT notional = |sz| × ctVal × bkPx
  * (sz is contracts; ctVal is coin per contract, e.g. 0.01 BTC for BTC-USDT-SWAP).
  */
-export async function okxLiquidations1h(rawSymbol: string): Promise<{
+export async function okxLiquidations1h(rawSymbol: string, allowMirrors = true): Promise<{
   longUsd: number
   shortUsd: number
   summary: string
@@ -1256,8 +1281,8 @@ export async function okxLiquidations1h(rawSymbol: string): Promise<{
       instType: 'SWAP',
       uly,
       state: 'filled',
-    }) as Promise<Array<{ details?: Array<Record<string, unknown>> }> | null>,
-    okxGet('/api/v5/public/instruments', { instType: 'SWAP', instId }).catch(() => null) as Promise<Array<Record<string, unknown>> | null>,
+    }, allowMirrors) as Promise<Array<{ details?: Array<Record<string, unknown>> }> | null>,
+    okxGet('/api/v5/public/instruments', { instType: 'SWAP', instId }, allowMirrors).catch(() => null) as Promise<Array<Record<string, unknown>> | null>,
   ])
   const ctVal = num(inst?.[0]?.['ctVal']) ?? 1
   const cutoff = Date.now() - 60 * 60 * 1000
@@ -1286,7 +1311,7 @@ export async function okxLiquidations1h(rawSymbol: string): Promise<{
  * OKX perpetual futures (ETHUSDT -> ETH-USDT-SWAP).
  * Multi-domain resilient with live open interest, funding rate, top positions, and taker volume.
  */
-export async function okxDerivatives(rawSymbol: string): Promise<Derivatives> {
+export async function okxDerivatives(rawSymbol: string, allowMirrors = true): Promise<Derivatives> {
   const symbol = normalizeSymbol(rawSymbol)
   const base = symbol.replace(/(USDT|USDC)$/, '')
   const quote = symbol.endsWith('USDC') ? 'USDC' : 'USDT'
@@ -1295,12 +1320,12 @@ export async function okxDerivatives(rawSymbol: string): Promise<Derivatives> {
   // Each leg degrades alone; no OI → getDerivatives falls through to Gate.
   // 5m hist covers ~8h (1h/4h); 15m hist covers ~25h for Δ24h.
   const [fundingData, oiData, oihData, oih15Data, markData, indexData] = await Promise.all([
-    okxGet('/api/v5/public/funding-rate', { instId }).catch(() => null),
-    okxGet('/api/v5/public/open-interest', { instType: 'SWAP', instId }).catch(() => null),
-    okxGet('/api/v5/rubik/stat/contracts/open-interest-history', { instId, period: '5m' }).catch(() => null),
-    okxGet('/api/v5/rubik/stat/contracts/open-interest-history', { instId, period: '15m' }).catch(() => null),
-    okxGet('/api/v5/public/mark-price', { instType: 'SWAP', instId }).catch(() => null),
-    okxGet('/api/v5/market/index-tickers', { instId: `${base}-${quote}` }).catch(() => null),
+    okxGet('/api/v5/public/funding-rate', { instId }, allowMirrors).catch(() => null),
+    okxGet('/api/v5/public/open-interest', { instType: 'SWAP', instId }, allowMirrors).catch(() => null),
+    okxGet('/api/v5/rubik/stat/contracts/open-interest-history', { instId, period: '5m' }, allowMirrors).catch(() => null),
+    okxGet('/api/v5/rubik/stat/contracts/open-interest-history', { instId, period: '15m' }, allowMirrors).catch(() => null),
+    okxGet('/api/v5/public/mark-price', { instType: 'SWAP', instId }, allowMirrors).catch(() => null),
+    okxGet('/api/v5/market/index-tickers', { instId: `${base}-${quote}` }, allowMirrors).catch(() => null),
   ])
   if (!Array.isArray(oiData) || oiData.length === 0) throw new Error(`OKX open interest unavailable for ${instId}`)
   // Per-instId series, paged back to the oldest OI bar (*-contract: limit ≤100/call).
@@ -1308,11 +1333,11 @@ export async function okxDerivatives(rawSymbol: string): Promise<Derivatives> {
   const oihRows0 = (oihData as Array<[string, string, string, string]> | null) ?? []
   const oldestOi = oihRows0.reduce((m, r) => Math.min(m, num(r[0]) ?? m), Infinity)
   const [topData, accData, topAccData, takerData] = await Promise.all([
-    okxPaged('/api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader', { instId, period: '5m' }, oldestOi),
-    okxPaged('/api/v5/rubik/stat/contracts/long-short-account-ratio-contract', { instId, period: '5m' }, oldestOi),
-    okxPaged('/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader', { instId, period: '5m' }, oldestOi),
+    okxPaged('/api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader', { instId, period: '5m' }, oldestOi, 5, allowMirrors),
+    okxPaged('/api/v5/rubik/stat/contracts/long-short-account-ratio-contract', { instId, period: '5m' }, oldestOi, 5, allowMirrors),
+    okxPaged('/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader', { instId, period: '5m' }, oldestOi, 5, allowMirrors),
     // unit: 0=coin, 1=contracts, 2=USDT. CVD is a coin quantity (same as Binance buyVol/sellVol).
-    okxPaged('/api/v5/rubik/stat/taker-volume-contract', { instId, period: '5m', unit: '0' }, oldestOi),
+    okxPaged('/api/v5/rubik/stat/taker-volume-contract', { instId, period: '5m', unit: '0' }, oldestOi, 5, allowMirrors),
   ])
 
   const f = (fundingData as Array<Record<string, unknown>> | null)?.[0] ?? {}
@@ -1523,7 +1548,7 @@ export async function okxDerivatives(rawSymbol: string): Promise<Derivatives> {
   let liquidationShortUsd1h: number | null = null
   let liquidationSummary: string | null = null
   try {
-    const liq = await okxLiquidations1h(symbol)
+    const liq = await okxLiquidations1h(symbol, allowMirrors)
     liquidationLongUsd1h = liq.longUsd
     liquidationShortUsd1h = liq.shortUsd
     liquidationSummary = liq.summary
@@ -1580,6 +1605,7 @@ export class OkxMarketProvider implements MarketDataProvider {
   constructor(
     id: string,
     private readonly symbols: string[],
+    private readonly allowUnofficialMirrors = true,
   ) {
     this.id = id
     this.description = `OKX public spot klines + SWAP derivatives (${symbols.length} symbols)`
@@ -1603,21 +1629,22 @@ export class OkxMarketProvider implements MarketDataProvider {
         `OKX spot: unsupported timeframe ${query.timeframe} (available: ${OKX_TIMEFRAMES.join(', ')})`,
       )
     }
-    return okxSpotCandles(query.symbol, query.timeframe, query.limit ?? 200, query.end)
+    return okxSpotCandles(query.symbol, query.timeframe, query.limit ?? 200, query.end, this.allowUnofficialMirrors)
   }
 
   async getDerivatives(rawSymbol: string): Promise<Derivatives> {
-    return okxDerivatives(rawSymbol)
+    return okxDerivatives(rawSymbol, this.allowUnofficialMirrors)
   }
 }
 
 export function apply(ctx: Context, config: Config): void {
+  const allowMirrors = config.allowUnofficialMirrors !== false
   ctx.effect(() => ctx.marketData.register(
-    new BinanceProvider(config.id ?? 'binance', config.symbols, config.baseURL, config.futuresURL ?? 'https://fapi.binance.com'),
+    new BinanceProvider(config.id ?? 'binance', config.symbols, config.baseURL, config.futuresURL ?? 'https://fapi.binance.com', allowMirrors),
   ))
   if (config.registerOkx !== false) {
     ctx.effect(() => ctx.marketData.register(
-      new OkxMarketProvider('okx', config.okxSymbols?.length ? config.okxSymbols : config.symbols),
+      new OkxMarketProvider('okx', config.okxSymbols?.length ? config.okxSymbols : config.symbols, allowMirrors),
     ))
   }
 }

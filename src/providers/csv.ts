@@ -12,7 +12,7 @@
  */
 
 import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Candle, InstrumentInfo, MarketDataProvider, OhlcvQuery, Timeframe } from '../market-data/index.js'
@@ -88,12 +88,28 @@ class CsvProvider implements MarketDataProvider {
   }
 
   async getOhlcv(query: OhlcvQuery): Promise<Candle[]> {
-    const file = join(this.root, query.symbol, `${query.timeframe}.csv`)
+    const sym = query.symbol
+    if (
+      !sym
+      || sym === '.'
+      || sym === '..'
+      || sym.includes('/')
+      || sym.includes('\\')
+      || /[\u0000-\u001f\u007f]/.test(sym)
+    ) {
+      throw new Error(`invalid CSV symbol '${query.symbol}': path escapes data root`)
+    }
+    const base = resolve(this.root)
+    const prefix = base.endsWith(sep) ? base : `${base}${sep}`
+    const file = resolve(base, sym, `${query.timeframe}.csv`)
+    if (!file.startsWith(prefix)) {
+      throw new Error(`invalid CSV symbol '${query.symbol}': path escapes data root`)
+    }
     let body: string
     try {
       body = await readFile(file, 'utf8')
     } catch {
-      throw new Error(`no data for ${query.symbol} @ ${query.timeframe} (expected ${file})`)
+      throw new Error(`no data for ${query.symbol} @ ${query.timeframe} (expected ${join(this.root, sym, `${query.timeframe}.csv`)})`)
     }
     let candles = parseCsv(body, file)
     if (query.start !== undefined) {

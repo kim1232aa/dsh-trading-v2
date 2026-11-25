@@ -6,7 +6,10 @@ import { createMainPaneTooltipFold } from '../../src/client/indicator-tooltip.js
 import { rsiGridIndicator } from '../../src/client/indicators/rsi-grid.js'
 import { mockChart } from '../../src/client/indicators/draw-context.js'
 
-const palette = { bg: '#fff', text: '#333c45', faint: '#8b949e', line: '#e5e8eb', up: '#26a17b', down: '#e0563f' }
+const palette = {
+  text: '#333c45', faint: '#8b949e', line: '#e5e8eb', up: '#26a17b', down: '#e0563f',
+  neckline: '#b08800', target: '#3b7dd8', invalidation: '#a475e0',
+}
 
 describe('subplot numerical legends', () => {
   it('keeps subplot names, parameters, and values visible without a crosshair', () => {

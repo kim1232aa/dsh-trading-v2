@@ -17,9 +17,6 @@ import { CoinglassCapi } from './providers/coinglass/index.js'
 import type { CoinglassService } from './providers/coinglass/index.js'
 import type { WatchlistStore } from './watchlist/store.js'
 
-let sharedCoinglass: CoinglassCapi | undefined
-const fallbackCoinglass = (): CoinglassCapi => (sharedCoinglass ??= new CoinglassCapi())
-
 export {
   chartPanelContextText,
   CHART_CONTEXT_PRESETS,
@@ -38,9 +35,12 @@ const VIEW_TTL_MS = 30_000
 
 export interface ChartHostOptions {
   watchlistStore?: WatchlistStore | undefined
+  watchlistEnabled?: boolean | undefined
 }
 
 export function applyChartHost(ctx: Context, options: ChartHostOptions = {}): void {
+  let sharedCoinglass: CoinglassCapi | undefined
+  const fallbackCoinglass = (): CoinglassCapi => (sharedCoinglass ??= new CoinglassCapi())
   let view: ChartView | undefined
   let viewAt = 0
 
@@ -49,6 +49,17 @@ export function applyChartHost(ctx: Context, options: ChartHostOptions = {}): vo
 
   const withWatchlistBridge = (marketData: MarketDataLike): MarketDataLike => {
     const store = options.watchlistStore
+    if (options.watchlistEnabled === false) {
+      return {
+        provider: id => marketData.provider(id),
+        ...(marketData.resolveProvider ? { resolveProvider: (sym, id) => marketData.resolveProvider!(sym, id) } : {}),
+        ...(marketData.searchWithProvider ? { searchWithProvider: (q, id) => marketData.searchWithProvider!(q, id) } : {}),
+        ...(marketData.list ? { list: () => marketData.list!() } : {}),
+        getWatchlist: async () => ({ items: [], groups: [] }),
+        addToWatchlist: async () => false,
+        removeFromWatchlist: async () => false,
+      }
+    }
     if (store === undefined) return marketData
     return {
       provider: id => marketData.provider(id),
@@ -234,9 +245,7 @@ export function applyChartHost(ctx: Context, options: ChartHostOptions = {}): vo
   })
 
   ctx.inject(['connection', 'marketData', 'webServer'], scoped => {
-    const connection = scoped.get('connection') as HostConnectionHandle & {
-      register?: (owner: Context, channel: string, handler: ConnectionRpcHandler) => () => unknown
-    }
+    const connection = scoped.get('connection') as HostConnectionHandle
     const marketData = scoped.get('marketData') as MarketDataLike
 
     scoped.effect(() => {
@@ -244,10 +253,9 @@ export function applyChartHost(ctx: Context, options: ChartHostOptions = {}): vo
         ? scoped.get('coinglass') as CoinglassService | undefined
         : undefined
       const handler = makeHandler(marketData, coinglass)
-      const dispose = typeof connection.register === 'function'
-        ? connection.register(scoped, MARKET_CHANNEL, handler)
-        : connection.rpc.handle(MARKET_CHANNEL, handler)
+      const dispose = connection.rpc.handle(MARKET_CHANNEL, handler)
       return () => {
+        sharedCoinglass = undefined
         void dispose()
       }
     }, 'dsh-trading: market data channel')

@@ -10,11 +10,9 @@ import {
 } from '../providers/coinglass/index.js'
 import type { CoinglassService, LargeOrdersSnapshot } from '../providers/coinglass/index.js'
 
-/** Reused so the pull cache and 429 cooldown survive between tool calls. */
-const fallbackClients = new Map<string, CoinglassCapi>()
-
 async function pullLargeOrders(
   ctx: Context,
+  fallbackClients: Map<string, CoinglassCapi>,
   symbol: string,
   opts: {
     hours?: number
@@ -63,6 +61,12 @@ async function pullLargeOrders(
 
 /** Register the large_orders research tool. */
 export function registerLargeOrdersTool(ctx: Context): void {
+  /** Scoped to this plugin fiber so reconfiguring/restarting clears stale caches and 429 cooldowns. */
+  const fallbackClients = new Map<string, CoinglassCapi>()
+  if (typeof (ctx as Partial<Context>).effect === 'function') {
+    ctx.effect(() => () => fallbackClients.clear())
+  }
+
   ctx.tools.register(defineTool({
     name: 'large_orders',
     description:
@@ -136,7 +140,7 @@ export function registerLargeOrdersTool(ctx: Context): void {
     isConcurrencySafe: () => true,
     async execute(args) {
       const top = args.top ?? 40
-      const snap = await pullLargeOrders(ctx, args.symbol, {
+      const snap = await pullLargeOrders(ctx, fallbackClients, args.symbol, {
         ...(args.hours !== undefined ? { hours: args.hours } : {}),
         top,
         ...(args.venue !== undefined ? { venue: args.venue } : {}),

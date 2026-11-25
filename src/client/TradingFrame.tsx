@@ -170,8 +170,24 @@ export function TradingFrame({
   const narrow = viewport < SIDEBAR_AUTO_COLLAPSE
   useEffect(() => { actions.setNarrow(narrow) }, [actions, narrow])
 
-  const windowsTitlebar = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-windows-titlebar')
-  const darwin = typeof document !== 'undefined' && document.documentElement.dataset['platform'] === 'darwin'
+  const [hostChrome, setHostChrome] = useState(() => ({
+    windowsTitlebar: typeof document !== 'undefined' && document.documentElement.hasAttribute('data-windows-titlebar'),
+    darwin: typeof document !== 'undefined' && document.documentElement.dataset['platform'] === 'darwin',
+  }))
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof MutationObserver !== 'function') return
+    const rootEl = document.documentElement
+    const sync = () => setHostChrome(prev => {
+      const windowsTitlebar = rootEl.hasAttribute('data-windows-titlebar')
+      const darwin = rootEl.dataset['platform'] === 'darwin'
+      return prev.windowsTitlebar === windowsTitlebar && prev.darwin === darwin ? prev : { windowsTitlebar, darwin }
+    })
+    sync()
+    const obs = new MutationObserver(sync)
+    obs.observe(rootEl, { attributes: true, attributeFilter: ['data-windows-titlebar', 'data-platform'] })
+    return () => obs.disconnect()
+  }, [])
+  const { windowsTitlebar, darwin } = hostChrome
   const drawer = viewport < SIDEBAR_DRAWER_BREAKPOINT && !windowsTitlebar
   const centeredSidebar = foldedLandscape && viewport >= SIDEBAR_DRAWER_BREAKPOINT
   const sidebarCollapsed = narrow ? !panels.narrowExpanded : panels.sidebar === 0

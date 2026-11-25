@@ -239,9 +239,9 @@ describe('MarketData query routing', () => {
       async getOrderbook(symbol: string) {
         return {
           symbol,
-          bids: [{ price: 100, volume: 10 }],
-          asks: [{ price: 101, volume: 12 }],
-          timestamp: 1234567890,
+          time: '2026-01-01T00:00:00.000Z',
+          bids: [{ price: 100, quantity: 10 }],
+          asks: [{ price: 101, quantity: 12 }],
         }
       },
       async getFundamentals(symbol: string) {

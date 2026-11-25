@@ -13,7 +13,7 @@ function render(name: string, coordinates: Coordinate[], options: Options = {}):
   const result = template.createPointFigures!({
     coordinates, bounding: { width, height, left: 0, right: width, top: 0, bottom: height },
     overlay: { extendData: { label, lane, color: '#00ff00', dashed: true } },
-  } as OverlayCreateFiguresCallbackParams)
+  } as OverlayCreateFiguresCallbackParams<unknown>)
   return Array.isArray(result) ? result : [result]
 }
 
@@ -39,7 +39,7 @@ describe('production annotation overlay callbacks', () => {
   it('preserves two anchors and keeps the caption in the pane', () => {
     const input = path.map(p => ({ ...p }))
     const figures = render('tm_polyline', input)
-    expect(figures[0]!.attrs.coordinates).toEqual(path)
+    expect((figures[0]!.attrs as { coordinates: Coordinate[] }).coordinates).toEqual(path)
     expect(input).toEqual(path)
     expect(caption(figures)!.x).toBe(600)
     expectInside(caption(figures))
@@ -48,15 +48,16 @@ describe('production annotation overlay callbacks', () => {
   it('preserves all ABC vertices instead of replacing the final leg', () => {
     const abc = [{ x: 100, y: 100 }, { x: 200, y: 200 }, { x: 300, y: 120 }, { x: 400, y: 240 }]
     const figures = render('tm_polyline', abc, { label: 'ABC路径' })
-    expect(figures[0]!.attrs.coordinates).toEqual(abc)
-    expect(figures[0]!.attrs.coordinates.at(-1)).toEqual({ x: 400, y: 240 })
+    const coords = (figures[0]!.attrs as { coordinates: Coordinate[] }).coordinates
+    expect(coords).toEqual(abc)
+    expect(coords.at(-1)).toEqual({ x: 400, y: 240 })
     expectInside(caption(figures))
   })
 
   it('preserves an explicit projection endpoint supplied by the producer', () => {
     const projected = [...path, { x: 850, y: 120 }]
     const figures = render('tm_polyline', projected)
-    expect(figures[0]!.attrs.coordinates).toEqual(projected)
+    expect((figures[0]!.attrs as { coordinates: Coordinate[] }).coordinates).toEqual(projected)
     expect(caption(figures)!.x).toBe(850)
   })
 
@@ -69,7 +70,7 @@ describe('production annotation overlay callbacks', () => {
     ['horizontal crossing', [{ x: -100, y: 200 }, { x: 1200, y: 200 }]],
   ])('labels the visible %s segment without changing its coordinates', (_, coordinates) => {
     const figures = render('tm_polyline', coordinates as Coordinate[])
-    expect(figures[0]!.attrs.coordinates).toEqual(coordinates)
+    expect((figures[0]!.attrs as { coordinates: Coordinate[] }).coordinates).toEqual(coordinates)
     expectInside(caption(figures))
   })
 
@@ -104,7 +105,7 @@ describe('production annotation overlay callbacks', () => {
     expect(text.x).toBe(994)
     expect(text.width).toBe(14 + 3 + 22 + 6)
     expect(measure).toHaveBeenCalledWith('Wi今日', expect.objectContaining({ family: 'Test Font', size: 11, weight: 500 }))
-    expect(figures.find(f => f.type === 'text')!.styles.align).toBeUndefined()
+    expect((figures.find(f => f.type === 'text')!.styles as { align?: unknown }).align).toBeUndefined()
     expectInside(text)
   })
 
@@ -132,7 +133,7 @@ describe('production annotation overlay callbacks', () => {
         coordinates: [{ x: 0, y: 200 }],
         bounding: { width: 1000, height: 500, left: 0, right: 1000, top: 0, bottom: 500 },
         overlay: { extendData: { label, lane, laneWidth: 255, color: '#f47067', dashed: true } },
-      } as OverlayCreateFiguresCallbackParams)
+      } as OverlayCreateFiguresCallbackParams<unknown>)
       return caption(Array.isArray(res) ? res : [res])!
     }
     const l0 = run(0)
@@ -190,7 +191,7 @@ describe('timed vertex captions on scripted paths', () => {
       coordinates, bounding: { width: 1000, height: 500, left: 0, right: 1000, top: 0, bottom: 500 },
       overlay: { points: [{ timestamp: t0, value: 1 }, { timestamp: t1, value: 2 }], extendData: { label: '剧本', color: '#00ff00', dashed: true, vertexNotes } },
       chart: { getTimezone: () => timezone },
-    } as unknown as OverlayCreateFiguresCallbackParams)
+    } as unknown as OverlayCreateFiguresCallbackParams<unknown>)
     return Array.isArray(result) ? result : [result]
   }
   const texts = (figures: OverlayFigure[]) => figures.filter(f => f.type === 'text').map(f => (f.attrs as TextAttrs).text)
@@ -204,7 +205,7 @@ describe('timed vertex captions on scripted paths', () => {
   it('draws a dot and a "time note" caption on each noted vertex, keeping the line intact', () => {
     const coords = [{ x: 200, y: 200 }, { x: 800, y: 300 }]
     const figures = renderNotes(coords, ['2102', 'L2 1935'])
-    expect(figures[0]!.attrs.coordinates).toEqual(coords)
+    expect((figures[0]!.attrs as { coordinates: Coordinate[] }).coordinates).toEqual(coords)
     expect(figures.filter(f => f.type === 'circle')).toHaveLength(2)
     expect(texts(figures)).toEqual(expect.arrayContaining(['11-03 12:00 2102', '11-03 19:00 L2 1935']))
   })
@@ -230,7 +231,7 @@ describe('大额成交 amount captions', () => {
       coordinates,
       bounding: { width, height: 200, left: 0, right: 0, top: 0, bottom: 0 },
       overlay: { extendData: { dots } },
-    } as unknown as OverlayCreateFiguresCallbackParams) as OverlayFigure[]
+    } as unknown as OverlayCreateFiguresCallbackParams<unknown>) as OverlayFigure[]
   const texts = (f: OverlayFigure[]) => f.filter(x => x.type === 'text').map(x => (x.attrs as TextAttrs).text)
 
   it('prints the trade size beside its dot', () => {

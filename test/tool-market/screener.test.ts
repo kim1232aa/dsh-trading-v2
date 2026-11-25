@@ -179,6 +179,7 @@ describe('screener', () => {
     const mockProvider: MarketDataProvider = {
       id: 'mock',
       description: 'Mock Provider',
+      listSymbols: async () => [],
       getOhlcv: async (query: any) => {
         const symbol = typeof query === 'string' ? query : query.symbol
         if (symbol === 'UP') {

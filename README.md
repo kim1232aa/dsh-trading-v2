@@ -150,7 +150,7 @@ src/tasks-schedule/ scheduled research tasks (create/list/remove/
   ```yaml
   - id: dsh-trading
     config:
-      tradingFrame: true     # set false to keep stock ui-layout (cards-only mode)
+      tradingFrame: true     # set false to keep stock ui-layout (cards-only mode; restarts plugin when changed)
       dataDir: ./data
       chartDir: ./charts
       providers:
@@ -159,7 +159,10 @@ src/tasks-schedule/ scheduled research tasks (create/list/remove/
         binance:
           enabled: true
           registerOkx: true
+          allowUnofficialMirrors: true   # set false to disable fallback to third-party domestic mirrors
   ```
+
+  > **Network endpoints note:** Official Binance/OKX APIs (`data-api.binance.vision`, `api.binance.com`, `fapi.binance.com`, `aws.okx.com`, `www.okx.com`) are queried first. When `providers.binance.allowUnofficialMirrors` is `true` (default), third-party domestic failover mirrors (`usnbweb.red`, `btmrvkxwhpn.com`, `ouyi.fit`) are tried only if official endpoints fail; set `allowUnofficialMirrors: false` to restrict requests strictly to official hosts.
 
 ### Timeframes
 
@@ -321,12 +324,15 @@ metadata: it never enters the model's context (zero token cost) and it replays
 with the session log.
 
 The card renderers are web-only; under a headless profile dsh falls back to the
-generic text card and the loopback channel never appears. The host half is not
-inert there, though — `get_chart_view` and the per-turn context line register
-wherever `ctx.tools` and `ctx.systemPrompt` exist, and simply report a closed
-panel.
+generic text card and the loopback channel never appears. When `chartPanel.enabled`
+is `false`, `applyChartHost` is skipped (so `get_chart_view` and the per-turn
+context line do not register either). Otherwise `get_chart_view` and the context
+line register wherever `ctx.tools` and `ctx.systemPrompt` exist, and report a
+closed panel when no chart is open.
 
 ## Development
+
+Requirements: **Node >=24.22.3** (matching DSH `0.2.3-alpha.2`) and `pnpm`.
 
 ```sh
 pnpm install

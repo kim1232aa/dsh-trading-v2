@@ -17,9 +17,14 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '24'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm typecheck
+      - run: pnpm run audit:all
       - run: pnpm test
+      - name: Install DSH CLI for real Loader e2e
+        run: npm install -g @deepseek-ai/dsh@0.2.3-alpha.2
+      - name: Run real DSH Loader e2e boot test
+        run: pnpm exec vitest run test/loader-boot.e2e.test.ts
